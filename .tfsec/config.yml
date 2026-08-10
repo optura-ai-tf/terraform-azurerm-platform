@@ -1,0 +1,32 @@
+# tfsec configuration for Azure AKS infrastructure
+# This file defines rule exclusions with justifications for Azure resources
+
+exclude:
+  # ===== Azure Critical Warnings =====
+
+  # azure-container-limit-authorized-ips
+  # Justification: Private cluster access via Teleport/VPN.
+  # The cluster enforces private-only API access (see ../ACCESS.md), so public
+  # IP range restrictions are not the security model being used.
+  - azure-container-limit-authorized-ips
+
+  # azure-keyvault-specify-network-acl
+  # Justification: Terraform deployment requires initial "Allow" access for
+  # resource creation (disk encryption sets, managed identities, certificates).
+  # After initial deployment, this can be locked down to specific networks or
+  # private endpoints if required.
+  - azure-keyvault-specify-network-acl
+
+  # ===== Azure Medium Warnings =====
+
+  # azure-container-logging
+  # Justification: Using self-hosted Loki for container logging to reduce costs
+  # and maintain consistency across AWS/Azure. Azure Monitor Container Insights
+  # adds $30-100+/month per cluster.
+  - azure-container-logging
+
+  # azure-keyvault-ensure-key-expiry
+  # Justification: Infrastructure encryption keys (AKS disk, ACR, PostgreSQL)
+  # are long-lived by design. Setting expiration requires complex rotation
+  # automation and risks service outage. Keys are protected by RBAC and audit logs.
+  - azure-keyvault-ensure-key-expiry
