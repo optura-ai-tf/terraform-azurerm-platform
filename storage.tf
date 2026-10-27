@@ -164,6 +164,20 @@ resource "azurerm_storage_account" "storage" {
   blob_properties {
     versioning_enabled = var.storage_general_versioning
 
+    # A presigned PUT is issued by the app but sent by the browser, so Azure
+    # answers the preflight itself. Account-wide: Azure has no per-container
+    # CORS.
+    dynamic "cors_rule" {
+      for_each = length(var.storage_general_cors_origins) > 0 ? [1] : []
+      content {
+        allowed_origins    = var.storage_general_cors_origins
+        allowed_methods    = ["GET", "HEAD", "PUT"]
+        allowed_headers    = ["*"]
+        exposed_headers    = ["ETag"]
+        max_age_in_seconds = 3000
+      }
+    }
+
     delete_retention_policy {
       days = 7
     }

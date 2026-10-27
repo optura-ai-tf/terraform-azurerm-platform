@@ -546,6 +546,12 @@ variable "storage_general_versioning" {
   default     = true
 }
 
+variable "storage_general_cors_origins" {
+  description = "Browser origins allowed to call the general storage account directly (presigned uploads). Empty disables CORS, which blocks every browser upload."
+  type        = list(string)
+  default     = []
+}
+
 variable "storage_general_lifecycle_enabled" {
   description = "Enable lifecycle management for general storage"
   type        = bool

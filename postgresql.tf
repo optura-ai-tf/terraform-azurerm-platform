@@ -215,16 +215,10 @@ resource "azurerm_postgresql_flexible_server_configuration" "extensions" {
 # ===================================================================
 
 # ConfigMap containing SQL script to create Azure AD user (per server).
-resource "kubernetes_config_map" "postgresql_ad_setup" {
-  for_each = var.access_mode == "teleport" && var.teleport_db_enabled && var.postgresql_enabled ? var.databases : {}
-
-  metadata {
-    name      = "postgresql-ad-setup-${var.environment}${local.db_name_suffix[each.key]}"
-    namespace = "teleport-agent"
-  }
-
-  data = {
-    "setup.sql" = <<-SQL
+locals {
+  postgresql_ad_setup_names        = { for k in keys(var.databases) : k => "postgresql-ad-setup-${var.environment}${local.db_name_suffix[k]}" }
+  postgresql_bootstrap_creds_names = { for k in keys(var.databases) : k => "postgresql-bootstrap-credentials-${var.environment}${local.db_name_suffix[k]}" }
+  postgresql_ad_setup_sql = { for k, v in(var.access_mode == "teleport" && var.teleport_db_enabled && var.postgresql_enabled ? var.databases : {}) : k => <<-SQL
       -- Bind the teleport_admin Postgres principal to the teleport_db_agent
       -- managed identity's Azure AD object ID. Five branches:
       --
@@ -316,7 +310,7 @@ resource "kubernetes_config_map" "postgresql_ad_setup" {
       $$;
 
       -- Grant connection privileges to all databases
-      GRANT CONNECT ON DATABASE ${azurerm_postgresql_flexible_server_database.main[each.key].name} TO "teleport_admin";
+      GRANT CONNECT ON DATABASE ${azurerm_postgresql_flexible_server_database.main[k].name} TO "teleport_admin";
       GRANT CONNECT ON DATABASE postgres TO "teleport_admin";
 
       -- Grant full privileges on public schema
@@ -328,7 +322,7 @@ resource "kubernetes_config_map" "postgresql_ad_setup" {
       GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO "teleport_admin";
 
       -- Allow creating new schemas
-      GRANT CREATE ON DATABASE ${azurerm_postgresql_flexible_server_database.main[each.key].name} TO "teleport_admin";
+      GRANT CREATE ON DATABASE ${azurerm_postgresql_flexible_server_database.main[k].name} TO "teleport_admin";
 
       -- Verify the setup
       SELECT
@@ -342,6 +336,24 @@ resource "kubernetes_config_map" "postgresql_ad_setup" {
       GROUP BY r.rolname, r.rolcanlogin;
     SQL
   }
+}
+
+resource "kubectl_manifest" "postgresql_ad_setup" {
+  for_each = var.access_mode == "teleport" && var.teleport_db_enabled && var.postgresql_enabled ? var.databases : {}
+
+  server_side_apply = true
+  force_conflicts   = true
+  yaml_body = yamlencode({
+    apiVersion = "v1"
+    kind       = "ConfigMap"
+    metadata = {
+      name      = local.postgresql_ad_setup_names[each.key]
+      namespace = "teleport-agent"
+    }
+    data = {
+      "setup.sql" = local.postgresql_ad_setup_sql[each.key]
+    }
+  })
 
   depends_on = [
     azurerm_postgresql_flexible_server.main,
@@ -351,20 +363,24 @@ resource "kubernetes_config_map" "postgresql_ad_setup" {
 }
 
 # Secret containing database connection info for bootstrap connection (per server).
-resource "kubernetes_secret" "postgresql_bootstrap_creds" {
+resource "kubectl_manifest" "postgresql_bootstrap_creds" {
   for_each = var.access_mode == "teleport" && var.teleport_db_enabled && var.postgresql_enabled ? var.databases : {}
 
-  metadata {
-    name      = "postgresql-bootstrap-credentials-${var.environment}${local.db_name_suffix[each.key]}"
-    namespace = "teleport-agent"
-  }
-
-  data = {
-    username = azurerm_user_assigned_identity.teleport_db_agent[0].name
-    host     = azurerm_postgresql_flexible_server.main[each.key].fqdn
-  }
-
-  type = "Opaque"
+  server_side_apply = true
+  force_conflicts   = true
+  yaml_body = yamlencode({
+    apiVersion = "v1"
+    kind       = "Secret"
+    type       = "Opaque"
+    metadata = {
+      name      = local.postgresql_bootstrap_creds_names[each.key]
+      namespace = "teleport-agent"
+    }
+    data = {
+      username = base64encode(azurerm_user_assigned_identity.teleport_db_agent[0].name)
+      host     = base64encode(azurerm_postgresql_flexible_server.main[each.key].fqdn)
+    }
+  })
 
   depends_on = [
     azurerm_postgresql_flexible_server.main,
@@ -373,7 +389,7 @@ resource "kubernetes_secret" "postgresql_bootstrap_creds" {
 }
 
 # Replacement trigger for the bootstrap Job. The Job needs to re-run whenever
-# the SQL inside `kubernetes_config_map.postgresql_ad_setup` changes — typically
+# the SQL inside `kubectl_manifest.postgresql_ad_setup` changes — typically
 # either an explicit code edit to the SQL string, or an MI principal_id change
 # (e.g. tenant transfer) which gets interpolated into the SQL.
 #
@@ -398,7 +414,7 @@ resource "terraform_data" "postgresql_ad_setup_hash" {
   # output (-/+), making the cascade to the Job unambiguous. With `input`,
   # the change would render as `~ in-place update`, which still triggers
   # `replace_triggered_by` but reads less clearly in plan diffs.
-  triggers_replace = [sha256(kubernetes_config_map.postgresql_ad_setup[each.key].data["setup.sql"])]
+  triggers_replace = [sha256(local.postgresql_ad_setup_sql[each.key])]
 }
 
 # Kubernetes Job to create Azure AD user (one per server).
@@ -500,7 +516,7 @@ resource "kubernetes_job_v1" "postgresql_ad_bootstrap" {
             name = "PGHOST"
             value_from {
               secret_key_ref {
-                name = kubernetes_secret.postgresql_bootstrap_creds[each.key].metadata[0].name
+                name = local.postgresql_bootstrap_creds_names[each.key]
                 key  = "host"
               }
             }
@@ -510,7 +526,7 @@ resource "kubernetes_job_v1" "postgresql_ad_bootstrap" {
             name = "PGUSER"
             value_from {
               secret_key_ref {
-                name = kubernetes_secret.postgresql_bootstrap_creds[each.key].metadata[0].name
+                name = local.postgresql_bootstrap_creds_names[each.key]
                 key  = "username"
               }
             }
@@ -547,7 +563,7 @@ resource "kubernetes_job_v1" "postgresql_ad_bootstrap" {
         volume {
           name = "scripts"
           config_map {
-            name = kubernetes_config_map.postgresql_ad_setup[each.key].metadata[0].name
+            name = local.postgresql_ad_setup_names[each.key]
           }
         }
 
@@ -577,8 +593,8 @@ resource "kubernetes_job_v1" "postgresql_ad_bootstrap" {
     azurerm_kubernetes_cluster.main,
     azurerm_postgresql_flexible_server.main,
     azurerm_postgresql_flexible_server_database.main,
-    kubernetes_config_map.postgresql_ad_setup,
-    kubernetes_secret.postgresql_bootstrap_creds,
+    kubectl_manifest.postgresql_ad_setup,
+    kubectl_manifest.postgresql_bootstrap_creds,
     azurerm_postgresql_flexible_server_active_directory_administrator.teleport,
     helm_release.teleport_kube_agent
   ]

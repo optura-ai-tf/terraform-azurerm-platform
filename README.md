@@ -641,6 +641,7 @@ The tables below are generated from the module source by `terraform-docs`. Do no
 | <a name="requirement_azuread"></a> [azuread](#requirement\_azuread) | >= 3.6 |
 | <a name="requirement_azurerm"></a> [azurerm](#requirement\_azurerm) | >= 4.65, < 5.0 |
 | <a name="requirement_helm"></a> [helm](#requirement\_helm) | >= 3.1 |
+| <a name="requirement_kubectl"></a> [kubectl](#requirement\_kubectl) | ~> 1.14 |
 | <a name="requirement_kubernetes"></a> [kubernetes](#requirement\_kubernetes) | >= 2.38 |
 | <a name="requirement_random"></a> [random](#requirement\_random) | >= 3.6 |
 | <a name="requirement_time"></a> [time](#requirement\_time) | >= 0.12 |
@@ -652,6 +653,7 @@ The tables below are generated from the module source by `terraform-docs`. Do no
 | <a name="provider_azuread"></a> [azuread](#provider\_azuread) | >= 3.6 |
 | <a name="provider_azurerm"></a> [azurerm](#provider\_azurerm) | >= 4.65, < 5.0 |
 | <a name="provider_helm"></a> [helm](#provider\_helm) | >= 3.1 |
+| <a name="provider_kubectl"></a> [kubectl](#provider\_kubectl) | ~> 1.14 |
 | <a name="provider_kubernetes"></a> [kubernetes](#provider\_kubernetes) | >= 2.38 |
 | <a name="provider_random"></a> [random](#provider\_random) | >= 3.6 |
 | <a name="provider_terraform"></a> [terraform](#provider\_terraform) | n/a |
@@ -734,18 +736,18 @@ No modules.
 | [azurerm_virtual_network.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/virtual_network) | resource |
 | [azurerm_web_application_firewall_policy.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/web_application_firewall_policy) | resource |
 | [helm_release.teleport_kube_agent](https://registry.terraform.io/providers/hashicorp/helm/latest/docs/resources/release) | resource |
-| [kubernetes_cluster_role.teleport_admin](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role) | resource |
-| [kubernetes_cluster_role.teleport_viewer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role) | resource |
-| [kubernetes_cluster_role_binding.teleport_admin](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_binding) | resource |
-| [kubernetes_cluster_role_binding.teleport_viewer](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_binding) | resource |
-| [kubernetes_cluster_role_binding.tfc_agent](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/cluster_role_binding) | resource |
-| [kubernetes_config_map.postgresql_ad_setup](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/config_map) | resource |
-| [kubernetes_deployment.tfc_agent](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/deployment) | resource |
+| [kubectl_manifest.postgresql_ad_setup](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.postgresql_bootstrap_creds](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.teleport_admin_binding](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.teleport_admin_role](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.teleport_viewer_binding](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.teleport_viewer_role](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.tfc_agent](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.tfc_agent_cluster_role_binding](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.tfc_agent_namespace](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.tfc_agent_service_account](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
+| [kubectl_manifest.tfc_agent_token](https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs/resources/manifest) | resource |
 | [kubernetes_job_v1.postgresql_ad_bootstrap](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/job_v1) | resource |
-| [kubernetes_namespace.tfc_agent](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/namespace) | resource |
-| [kubernetes_secret.postgresql_bootstrap_creds](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/secret) | resource |
-| [kubernetes_secret.tfc_agent_token](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/secret) | resource |
-| [kubernetes_service_account.tfc_agent](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/service_account) | resource |
 | [random_password.postgresql_admin](https://registry.terraform.io/providers/hashicorp/random/latest/docs/resources/password) | resource |
 | [terraform_data.byo_subnet_guard](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [terraform_data.postgresql_ad_setup_hash](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
@@ -813,6 +815,7 @@ No modules.
 | <a name="input_registry_enabled"></a> [registry\_enabled](#input\_registry\_enabled) | Deploy Azure Container Registry | `bool` | `false` | no |
 | <a name="input_service_cidr"></a> [service\_cidr](#input\_service\_cidr) | In-cluster ClusterIP service range for AKS (Azure CNI). Must NOT overlap the VNet address space or any subnet — critical when create\_vnet=false and the VNet is centrally managed. | `string` | `"10.1.0.0/16"` | no |
 | <a name="input_storage_general_account_name"></a> [storage\_general\_account\_name](#input\_storage\_general\_account\_name) | Override storage account name for general storage (default: {project}{environment}storage). Used to dodge Azure's ~14-day global name reservation when redeploying. Must be 3-24 lowercase alphanumeric chars. | `string` | `null` | no |
+| <a name="input_storage_general_cors_origins"></a> [storage\_general\_cors\_origins](#input\_storage\_general\_cors\_origins) | Browser origins allowed to call the general storage account directly (presigned uploads). Empty disables CORS, which blocks every browser upload. | `list(string)` | `[]` | no |
 | <a name="input_storage_general_enabled"></a> [storage\_general\_enabled](#input\_storage\_general\_enabled) | Deploy general storage account | `bool` | `true` | no |
 | <a name="input_storage_general_lifecycle_enabled"></a> [storage\_general\_lifecycle\_enabled](#input\_storage\_general\_lifecycle\_enabled) | Enable lifecycle management for general storage | `bool` | `false` | no |
 | <a name="input_storage_general_private_endpoint_enabled"></a> [storage\_general\_private\_endpoint\_enabled](#input\_storage\_general\_private\_endpoint\_enabled) | Provision a private endpoint + privatelink.blob.core.windows.net DNS<br/>zone for the general storage blob endpoint, linked to the AKS VNet.<br/>In-cluster traffic resolves the storage hostname to the PE's private<br/>IP and stays on the Azure backbone (no NAT egress, no internet hop).<br/>The account itself stays public — external clients are unaffected.<br/><br/>Defaults to false so existing workspaces with `storage_general_enabled<br/>= true` do not pick up surprise new PE + DNS resources on next apply.<br/>Opt in explicitly per workspace.<br/><br/>Leave at false when `create_vnet = false` and your environment manages<br/>privatelink.blob.core.windows.net centrally — Azure rejects multiple<br/>VNet links to zones of the same name, and the PE's DNS record has to<br/>be added to the central zone out-of-band. | `bool` | `false` | no |

@@ -33,6 +33,10 @@ terraform {
       source  = "hashicorp/helm"
       version = ">= 3.1"
     }
+    kubectl = {
+      source  = "gavinbunney/kubectl"
+      version = "~> 1.14"
+    }
   }
 }
 
@@ -78,6 +82,15 @@ provider "kubernetes" {
   token                  = local.k8s_token
   client_certificate     = local.k8s_client_cert
   client_key             = local.k8s_client_key
+}
+
+provider "kubectl" {
+  host                   = local.k8s_host
+  cluster_ca_certificate = local.k8s_ca_cert
+  token                  = local.k8s_token
+  client_certificate     = local.k8s_client_cert
+  client_key             = local.k8s_client_key
+  load_config_file       = false
 }
 
 # Helm Provider
