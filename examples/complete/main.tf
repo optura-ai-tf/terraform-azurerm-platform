@@ -25,27 +25,28 @@ module "platform" {
   # Azure AD group for cluster admins.
   aks_admin_group_name = "[REPLACE]"
 
-  # The system pool is the cluster's inline default_node_pool.
-  system_node_pool = {
-    node_count = 2
-    vm_size    = "Standard_D2s_v3"
-  }
-
-  # User-mode pools, keyed by name. workload-type labels drive nodeSelectors.
-  user_node_pools = {
+  # Node pools, keyed by name. "system" is the cluster's inline system pool.
+  # workload-type labels drive nodeSelectors.
+  node_groups = {
+    system = {
+      vm_size  = "Standard_D2s_v3"
+      min_size = 2
+      max_size = 2
+      labels   = { "workload-type" = "system" }
+    }
     support = {
       vm_size                     = "Standard_D2s_v3"
-      min_count                   = 1
-      max_count                   = 3
-      os_disk_size_gb             = 128
+      min_size                    = 1
+      max_size                    = 3
+      disk_size                   = 128
       temporary_name_for_rotation = "supprttmp"
       labels                      = { "workload-type" = "support" }
     }
     application = {
       vm_size                     = "Standard_D4s_v3"
-      min_count                   = 1
-      max_count                   = 5
-      os_disk_size_gb             = 256
+      min_size                    = 1
+      max_size                    = 5
+      disk_size                   = 256
       temporary_name_for_rotation = "apptmp"
       labels                      = { "workload-type" = "application" }
     }
@@ -55,12 +56,18 @@ module "platform" {
   appgw_capacity_min = 1
   appgw_capacity_max = 3
 
-  # App Gateway frontend. The module default is now "private" (no public IP),
-  # which needs the EnableApplicationGatewayNetworkIsolation subscription feature
-  # and use-private-ip ingress annotations. This getting-started example opts
-  # into a public frontend for simplicity; set appgw_frontend_type = "private"
-  # (with appgw_private_ip_address for BYO subnets) for private mode.
-  appgw_frontend_type = "public"
+  # Everything is private by default: private App Gateway frontend (needs the
+  # EnableApplicationGatewayNetworkIsolation subscription feature and
+  # use-private-ip ingress annotations), private AKS API, and storage / Key
+  # Vault behind private endpoints. The API is created in this same apply, so
+  # this getting-started example opts into a public, CIDR-restricted API.
+  # For a private API, run Terraform from inside a pre-built VNet instead.
+  private_cluster_enabled     = false
+  api_server_authorized_cidrs = ["[REPLACE]"] # your runner's egress CIDR(s)
+
+  # Key Vault (enable_cmk defaults to true) is deny-all. Allow the runner
+  # through, or run inside the VNet and rely on the private endpoint.
+  key_vault_allowed_ip_ranges = ["[REPLACE]"]
 
   # Managed PostgreSQL (enabled by default).
   postgresql_sku_name   = "GP_Standard_D2s_v3"

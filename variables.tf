@@ -36,6 +36,28 @@ variable "tags" {
   default     = {}
 }
 
+variable "key_vault_private_endpoint_enabled" {
+  description = "Create a private endpoint + privatelink.vaultcore.azure.net DNS zone for the CMK Key Vault (enable_cmk = true), linked to the VNet. Default true. The vault firewall always denies public traffic except Azure trusted services and key_vault_allowed_ip_ranges, so Terraform must reach the vault through this endpoint or an allowed range. Set false when privatelink.vaultcore.azure.net is managed centrally."
+  type        = bool
+  default     = true
+
+  validation {
+    condition     = !var.enable_cmk || var.key_vault_private_endpoint_enabled || length(var.key_vault_allowed_ip_ranges) > 0
+    error_message = "With enable_cmk = true, Terraform must reach the Key Vault data plane: keep key_vault_private_endpoint_enabled = true or set key_vault_allowed_ip_ranges."
+  }
+}
+
+variable "key_vault_allowed_ip_ranges" {
+  description = "Public IPs/CIDRs allowed through the CMK Key Vault firewall (e.g. a Terraform runner outside the VNet). Give a single IP as a bare address (1.2.3.4): Key Vault rejects /31 and /32. Default empty: public traffic is denied except Azure trusted services."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for r in var.key_vault_allowed_ip_ranges : !endswith(r, "/31") && !endswith(r, "/32")])
+    error_message = "Key Vault rejects /31 and /32 CIDRs in key_vault_allowed_ip_ranges. Give single IPs as bare addresses (e.g. 1.2.3.4)."
+  }
+}
+
 variable "enable_cmk" {
   description = "Use customer-managed keys (CMK) for encryption. When false, Azure uses platform-managed keys (PMK) instead — data is still AES-256 encrypted at rest, Azure just manages the key. Set to false for subscription transfers to eliminate Key Vault and encryption identity dependencies."
   type        = bool
@@ -149,45 +171,88 @@ variable "dns_service_ip" {
   }
 }
 
+variable "pod_cidr" {
+  description = <<-EOT
+    Pod IP range for Azure CNI Overlay (the default). Pods take IPs from this
+    range instead of the AKS subnet, the range is never routed (pod egress is
+    SNAT'd to the node IP), and the AKS subnet only needs to hold nodes and
+    private endpoints. Each node takes a /24 from the range, so the default
+    /16 fits 256 nodes. Must not overlap service_cidr, the VNet, or any
+    peered / on-premises network. Set null for Azure CNI without overlay
+    (pods take VNet IPs; size the AKS subnet for it).
+
+    Set it before the first apply: changing it forces a new cluster. With
+    overlay, the App Gateway subnet must be /24 or smaller and delegated to
+    Microsoft.Network/applicationGateways (the module adds the delegation
+    when create_vnet = true; do it yourself on a BYO subnet).
+  EOT
+  type        = string
+  default     = "100.64.0.0/16"
+
+  validation {
+    condition     = var.pod_cidr == null || can(cidrhost(var.pod_cidr, 0))
+    error_message = "pod_cidr must be a valid IPv4 CIDR (e.g. 100.64.128.0/17)."
+  }
+
+  # Overlap check: either range contains the other's network address.
+  validation {
+    condition = var.pod_cidr == null ? true : (
+      cidrhost("${cidrhost(var.service_cidr, 0)}/${split("/", var.pod_cidr)[1]}", 0) != cidrhost(var.pod_cidr, 0) &&
+      cidrhost("${cidrhost(var.pod_cidr, 0)}/${split("/", var.service_cidr)[1]}", 0) != cidrhost(var.service_cidr, 0)
+    )
+    error_message = "pod_cidr must not overlap service_cidr."
+  }
+
+  validation {
+    condition = var.pod_cidr == null || !var.create_vnet ? true : alltrue([
+      for v in var.vnet_address_space :
+      cidrhost("${cidrhost(v, 0)}/${split("/", var.pod_cidr)[1]}", 0) != cidrhost(var.pod_cidr, 0) &&
+      cidrhost("${cidrhost(var.pod_cidr, 0)}/${split("/", v)[1]}", 0) != cidrhost(v, 0)
+    ])
+    error_message = "pod_cidr must not overlap vnet_address_space."
+  }
+
+  validation {
+    condition     = var.pod_cidr == null || !var.create_vnet ? true : tonumber(split("/", var.appgw_subnet_address_prefix)[1]) >= 24
+    error_message = "With pod_cidr (overlay), AGIC requires the App Gateway subnet to be /24 or smaller (appgw_subnet_address_prefix)."
+  }
+}
+
+variable "network_data_plane" {
+  description = "AKS network dataplane. null (default): \"cilium\" with overlay (pod_cidr set), \"azure\" without. \"cilium\": Azure CNI Powered by Cilium, eBPF dataplane without kube-proxy, Cilium network policy; requires overlay. \"azure\": legacy dataplane with Azure network policy; use it to keep overlay without Cilium. Switching azure -> cilium upgrades in place (reimages every node); cilium -> azure forces a new cluster."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.network_data_plane == null ? true : contains(["azure", "cilium"], var.network_data_plane)
+    error_message = "network_data_plane must be null, azure or cilium."
+  }
+
+  validation {
+    condition     = var.network_data_plane != "cilium" || var.pod_cidr != null
+    error_message = "network_data_plane = \"cilium\" requires Azure CNI Overlay (pod_cidr set)."
+  }
+}
+
 # ===== AKS Configuration =====
 
 variable "kubernetes_version" {
   description = "Kubernetes version"
   type        = string
-  default     = "1.34"
+  default     = "1.35"
 }
 
-# System node pool. Azure pins exactly one system-mode pool inline on the cluster
-# resource (default_node_pool), so it cannot be a user_node_pools map entry —
-# expressing it as one would require recreating the entire cluster.
-variable "system_node_pool" {
-  description = "AKS system node pool (the cluster's inline default_node_pool)"
-  type = object({
-    vm_size    = string
-    node_count = number
-  })
-  default = {
-    vm_size    = "Standard_D2s_v6"
-    node_count = 3
-  }
-  validation {
-    condition     = var.system_node_pool.node_count >= 1 && var.system_node_pool.node_count <= 5
-    error_message = "System node count must be between 1 and 5."
-  }
-}
-
-# User (non-system) AKS node pools, keyed by pool name. Uses the map-based
-# node-pool convention so GPU and other future pools are a workspace var change,
-# not a module change.
-variable "user_node_pools" {
-  description = "Map of AKS user-mode node pools (excludes the inline system pool)"
+# "system" is the cluster's inline default_node_pool, which azurerm requires on
+# the cluster resource; every other key is a separate node pool resource.
+variable "node_groups" {
+  description = "AKS node pools keyed by name. \"system\" is the cluster's system pool; every other key is a user pool. A pool autoscales between min_size and max_size, or is fixed at that size when they are equal."
   type = map(object({
     vm_size                     = string
-    min_count                   = number
-    max_count                   = number
-    os_disk_size_gb             = optional(number, 128)
-    temporary_name_for_rotation = string
-    labels                      = optional(map(string), {})
+    min_size                    = number
+    max_size                    = number
+    disk_size                   = optional(number, 128)
+    temporary_name_for_rotation = optional(string)
+    labels                      = map(string)
     taints = optional(list(object({
       key    = string
       value  = string
@@ -195,22 +260,34 @@ variable "user_node_pools" {
     })), [])
   }))
   default = {
+    system = {
+      vm_size   = "Standard_D2s_v6"
+      min_size  = 3
+      max_size  = 3
+      disk_size = 128
+      labels    = { "workload-type" = "system" }
+    }
     support = {
       vm_size                     = "Standard_E2as_v7"
-      min_count                   = 1
-      max_count                   = 3
-      os_disk_size_gb             = 128
+      min_size                    = 1
+      max_size                    = 3
+      disk_size                   = 128
       temporary_name_for_rotation = "supprttmp"
       labels                      = { "workload-type" = "support" }
     }
     application = {
       vm_size                     = "Standard_D4as_v7"
-      min_count                   = 1
-      max_count                   = 3
-      os_disk_size_gb             = 256
+      min_size                    = 1
+      max_size                    = 3
+      disk_size                   = 256
       temporary_name_for_rotation = "apptmp"
       labels                      = { "workload-type" = "application" }
     }
+  }
+
+  validation {
+    condition     = contains(keys(var.node_groups), "system")
+    error_message = "node_groups must include a \"system\" key."
   }
 
   # Map keys (and temporary_name_for_rotation) become AKS node pool names, which
@@ -218,24 +295,38 @@ variable "user_node_pools" {
   # Guard here so a bad name fails at plan, not mid-apply.
   validation {
     condition = alltrue([
-      for k, v in var.user_node_pools : can(regex("^[a-z][a-z0-9]{0,11}$", k)) && can(regex("^[a-z][a-z0-9]{0,11}$", v.temporary_name_for_rotation))
+      for k, v in var.node_groups : can(regex("^[a-z][a-z0-9]{0,11}$", k)) && (v.temporary_name_for_rotation == null || can(regex("^[a-z][a-z0-9]{0,11}$", v.temporary_name_for_rotation)))
     ])
-    error_message = "Each user_node_pools key and its temporary_name_for_rotation must match ^[a-z][a-z0-9]{0,11}$ (lowercase alphanumeric, start with a letter, max 12 chars)."
+    error_message = "Each node_groups key and its temporary_name_for_rotation must match ^[a-z][a-z0-9]{0,11}$ (lowercase alphanumeric, start with a letter, max 12 chars)."
+  }
+
+  # A rotation name that matches a pool name, or another pool's rotation name,
+  # fails mid-apply. Same derivation as local.rotation_names in aks.tf.
+  validation {
+    condition = (
+      length(distinct([
+        for k, v in var.node_groups : coalesce(v.temporary_name_for_rotation, "${substr(k, 0, 9)}tmp")
+      ])) == length(var.node_groups) &&
+      length(setintersection(keys(var.node_groups), [
+        for k, v in var.node_groups : coalesce(v.temporary_name_for_rotation, "${substr(k, 0, 9)}tmp")
+      ])) == 0
+    )
+    error_message = "Each node_groups rotation name (temporary_name_for_rotation, or the default: the first 9 characters of the key plus \"tmp\") must be unique and must not equal any pool name. Set temporary_name_for_rotation explicitly to fix a clash."
   }
 
   # CLOUD_PROVIDER_GUIDE requires a workload-type label on every pool (workloads
   # target it via nodeSelector). node-pool is auto-injected from the key.
   validation {
     condition = alltrue([
-      for v in values(var.user_node_pools) : contains(keys(v.labels), "workload-type")
+      for v in values(var.node_groups) : contains(keys(v.labels), "workload-type")
     ])
-    error_message = "Each user_node_pools entry must set a \"workload-type\" label (used by workload nodeSelectors)."
+    error_message = "Each node_groups entry must set a \"workload-type\" label (used by workload nodeSelectors)."
   }
 
   # Azure taint effects are PascalCase; a typo otherwise passes plan and fails at the API.
   validation {
     condition = alltrue([
-      for v in values(var.user_node_pools) : alltrue([
+      for v in values(var.node_groups) : alltrue([
         for t in v.taints : contains(["NoSchedule", "PreferNoSchedule", "NoExecute"], t.effect)
       ])
     ])
@@ -247,6 +338,20 @@ variable "availability_zones" {
   description = "Availability zones for AKS nodes"
   type        = list(string)
   default     = ["1", "3"] # eastus2 only supports zones 1 and 3
+}
+
+variable "aks_outbound_type" {
+  description = "AKS egress method. \"loadBalancer\" (default) gives nodes a public egress IP on the cluster load balancer. \"userDefinedRouting\" creates no public IP: egress follows the AKS subnet's route table (e.g. 0.0.0.0/0 to a hub firewall), which must be associated with the subnet before the cluster is created, so it requires create_vnet = false (BYO subnet). Changing it on an existing cluster may force replacement."
+  type        = string
+  default     = "loadBalancer"
+  validation {
+    condition     = contains(["loadBalancer", "userDefinedRouting"], var.aks_outbound_type)
+    error_message = "aks_outbound_type must be loadBalancer or userDefinedRouting."
+  }
+  validation {
+    condition     = var.aks_outbound_type == "loadBalancer" || !var.create_vnet
+    error_message = "aks_outbound_type = \"userDefinedRouting\" requires create_vnet = false: the module-created AKS subnet has no route table."
+  }
 }
 
 variable "api_server_authorized_cidrs" {
@@ -286,9 +391,31 @@ variable "acr_sku" {
 }
 
 variable "acr_public_network_enabled" {
-  description = "Enable public network access to ACR"
+  description = "Open the ACR public endpoint to all networks. Default false: the registry is reachable only through its private endpoint, plus acr_allowed_ip_ranges when set."
+  type        = bool
+  default     = false
+}
+
+variable "acr_allowed_ip_ranges" {
+  description = "CIDRs allowed through the ACR firewall on the public endpoint (e.g. a vendor CI that pushes images). When non-empty, the public endpoint is enabled with default_action = Deny and only these ranges allowed. Premium SKU only."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = length(var.acr_allowed_ip_ranges) == 0 || var.acr_sku == "Premium"
+    error_message = "acr_allowed_ip_ranges requires acr_sku = \"Premium\" (ACR network rules are Premium-only)."
+  }
+}
+
+variable "acr_private_endpoint_enabled" {
+  description = "Create a private endpoint + privatelink.azurecr.io DNS zone for ACR, linked to the VNet. Premium SKU only. Set false when privatelink.azurecr.io is managed centrally and register the endpoint out-of-band."
   type        = bool
   default     = true
+
+  validation {
+    condition     = !var.registry_enabled || !var.acr_private_endpoint_enabled || var.acr_sku == "Premium"
+    error_message = "acr_private_endpoint_enabled requires acr_sku = \"Premium\". Use Premium, or set acr_private_endpoint_enabled = false and allow access explicitly."
+  }
 }
 
 variable "acr_zone_redundancy_enabled" {
@@ -563,22 +690,44 @@ variable "storage_general_private_endpoint_enabled" {
     Provision a private endpoint + privatelink.blob.core.windows.net DNS
     zone for the general storage blob endpoint, linked to the AKS VNet.
     In-cluster traffic resolves the storage hostname to the PE's private
-    IP and stays on the Azure backbone (no NAT egress, no internet hop).
-    The account itself stays public — external clients are unaffected.
+    IP and stays on the Azure backbone. Default true.
 
-    Defaults to false so existing workspaces with `storage_general_enabled
-    = true` do not pick up surprise new PE + DNS resources on next apply.
-    Opt in explicitly per workspace.
-
-    Leave at false when `create_vnet = false` and your environment manages
+    Set false when `create_vnet = false` and your environment manages
     privatelink.blob.core.windows.net centrally — Azure rejects multiple
     VNet links to zones of the same name, and the PE's DNS record has to
     be added to the central zone out-of-band.
   EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
+variable "storage_logging_private_endpoint_enabled" {
+  description = "Provision a private endpoint for the logging storage blob endpoint, registered in the same privatelink.blob.core.windows.net zone as the general storage endpoint. Default true. Same central-DNS caveat as storage_general_private_endpoint_enabled."
+  type        = bool
+  default     = true
+}
+
+variable "storage_public_network_access_enabled" {
+  description = "Allow public network access to the logging and general storage accounts. Default false: they are reachable only through their private endpoints, so every enabled account needs its private endpoint, and browser uploads via presigned URLs need a private network path (and privatelink DNS) to the endpoint. Set true for a public App Gateway frontend."
+  type        = bool
+  default     = false
+
+  validation {
+    condition = var.storage_public_network_access_enabled || (
+      (!var.storage_logging_enabled || var.storage_logging_private_endpoint_enabled) &&
+      (!var.storage_general_enabled || var.storage_general_private_endpoint_enabled)
+    )
+    error_message = "storage_public_network_access_enabled = false requires storage_logging_private_endpoint_enabled and storage_general_private_endpoint_enabled for each enabled storage account."
+  }
+
+  # Browsers upload straight to general storage via presigned URLs. With a
+  # public App Gateway those browsers are on the internet, so a private-only
+  # account silently breaks uploads — make the choice explicit.
+  validation {
+    condition     = var.storage_public_network_access_enabled || !var.storage_general_enabled || !contains(["public", "both"], var.appgw_frontend_type)
+    error_message = "appgw_frontend_type = \"public\"/\"both\" serves internet users, whose browsers upload to general storage via presigned URLs. Set storage_public_network_access_enabled = true, or use a private frontend."
+  }
+}
 
 variable "storage_logging_account_name" {
   description = "Override storage account name for logging storage (default: {project}{environment}logging). Used to dodge Azure's ~14-day global name reservation when redeploying. Must be 3-24 lowercase alphanumeric chars."
@@ -851,14 +1000,9 @@ variable "tfc_agent_version" {
 # ===== Private Cluster Configuration =====
 
 variable "private_cluster_enabled" {
-  description = "Enable fully private cluster API (no public endpoint)"
+  description = "Private cluster API (no public endpoint). Default true. Terraform must run from a host that can reach and resolve the private API: a runner inside the VNet or a peered network (e.g. an HCP Terraform agent on a VM). The in-cluster TFC agent cannot bootstrap a private cluster. Set false (with api_server_authorized_cidrs) to opt into a public API. Changing this forces a new cluster."
   type        = bool
-  default     = false
-
-  validation {
-    condition     = !var.private_cluster_enabled || var.tfc_agent_enabled
-    error_message = "tfc_agent_enabled must be true when private_cluster_enabled is true"
-  }
+  default     = true
 }
 
 # ===== Azure AI Foundry =====

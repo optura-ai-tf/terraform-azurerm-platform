@@ -52,6 +52,13 @@ provider "azurerm" {
       purge_soft_delete_on_destroy    = false
       recover_soft_deleted_key_vaults = true
     }
+    # Storage accounts are private by default and their private endpoints
+    # come after them, so skip data-plane calls during create. This module
+    # has no data-plane storage resources: containers and management
+    # policies go through ARM (storage_account_id).
+    storage {
+      data_plane_available = false
+    }
   }
 }
 

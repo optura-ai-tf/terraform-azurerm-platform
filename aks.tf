@@ -5,6 +5,16 @@ data "azuread_group" "aks_admins" {
   security_enabled = true
 }
 
+locals {
+  system_pool = var.node_groups["system"]
+  user_pools  = { for k, v in var.node_groups : k => v if k != "system" }
+  # Keep in sync with the node_groups rotation name validation.
+  rotation_names = {
+    for k, v in var.node_groups : k => coalesce(v.temporary_name_for_rotation, "${substr(k, 0, 9)}tmp")
+  }
+  network_data_plane = coalesce(var.network_data_plane, var.pod_cidr != null ? "cilium" : "azure")
+}
+
 # Azure Kubernetes Service Cluster
 resource "azurerm_kubernetes_cluster" "main" {
   name                = local.resource_names.aks
@@ -21,24 +31,26 @@ resource "azurerm_kubernetes_cluster" "main" {
 
   # System node pool (tainted for system workloads only)
   default_node_pool {
-    name                         = "system"
-    temporary_name_for_rotation  = "systmp"
-    vm_size                      = var.system_node_pool.vm_size
-    node_count                   = var.system_node_pool.node_count
+    name                        = "system"
+    temporary_name_for_rotation = local.rotation_names["system"]
+    vm_size                     = local.system_pool.vm_size
+    # Fixed size when min_size == max_size. Otherwise autoscaled, and node_count
+    # is left to the autoscaler (null) so its changes don't show as drift.
+    auto_scaling_enabled         = local.system_pool.min_size != local.system_pool.max_size
+    min_count                    = local.system_pool.min_size != local.system_pool.max_size ? local.system_pool.min_size : null
+    max_count                    = local.system_pool.min_size != local.system_pool.max_size ? local.system_pool.max_size : null
+    node_count                   = local.system_pool.min_size != local.system_pool.max_size ? null : local.system_pool.min_size
     zones                        = var.availability_zones
     type                         = "VirtualMachineScaleSets"
     os_disk_type                 = "Managed"
-    os_disk_size_gb              = 128
+    os_disk_size_gb              = local.system_pool.disk_size
     only_critical_addons_enabled = true
 
     # VNet integration
     vnet_subnet_id = local.aks_subnet_id
 
     # Labels
-    node_labels = {
-      "workload-type" = "system"
-      "node-pool"     = "system"
-    }
+    node_labels = merge(local.system_pool.labels, { "node-pool" = "system" })
 
     upgrade_settings {
       max_surge = "10%"
@@ -49,9 +61,17 @@ resource "azurerm_kubernetes_cluster" "main" {
 
   # Network configuration - Azure CNI
   network_profile {
-    network_plugin    = "azure"
-    network_policy    = "azure"
-    load_balancer_sku = "standard"
+    network_plugin = "azure"
+    # Overlay when pod_cidr is set: pods take IPs from pod_cidr (never routed,
+    # SNAT'd to the node IP), so the AKS subnet only holds nodes and endpoints.
+    # Overlay also runs the Cilium dataplane by default, which enforces
+    # network policy (see local.network_data_plane).
+    network_plugin_mode = var.pod_cidr != null ? "overlay" : null
+    network_data_plane  = local.network_data_plane
+    network_policy      = local.network_data_plane
+    pod_cidr            = var.pod_cidr
+    load_balancer_sku   = "standard"
+    outbound_type       = var.aks_outbound_type
     # Service CIDR for ClusterIP services (must not overlap with VNet)
     service_cidr   = var.service_cidr
     dns_service_ip = var.dns_service_ip
@@ -112,6 +132,16 @@ resource "azurerm_kubernetes_cluster" "main" {
     ignore_changes = [
       default_node_pool[0].upgrade_settings
     ]
+
+    # The variable validation only covers a module-created VNet; this checks a BYO one.
+    precondition {
+      condition = var.pod_cidr == null || var.create_vnet ? true : alltrue([
+        for v in data.azurerm_virtual_network.existing[0].address_space :
+        cidrhost("${cidrhost(v, 0)}/${split("/", var.pod_cidr)[1]}", 0) != cidrhost(var.pod_cidr, 0) &&
+        cidrhost("${cidrhost(var.pod_cidr, 0)}/${split("/", v)[1]}", 0) != cidrhost(v, 0)
+      ])
+      error_message = "pod_cidr must not overlap the existing VNet's address space."
+    }
   }
 
   # Note: Role assignments depend on this cluster's AGIC identity

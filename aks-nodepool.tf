@@ -1,25 +1,25 @@
 # User Node Pools (support, application, and any future pools e.g. gpu)
-# Keyed by var.user_node_pools. The system pool is the cluster's inline
+# Every var.node_groups key except "system", which is the cluster's inline
 # default_node_pool (see aks.tf) and is NOT managed here.
 resource "azurerm_kubernetes_cluster_node_pool" "user" {
-  for_each = var.user_node_pools
+  for_each = local.user_pools
 
   name                        = each.key
-  temporary_name_for_rotation = each.value.temporary_name_for_rotation
+  temporary_name_for_rotation = local.rotation_names[each.key]
   kubernetes_cluster_id       = azurerm_kubernetes_cluster.main.id
   vm_size                     = each.value.vm_size
   zones                       = var.availability_zones
 
-  # Auto-scaling configuration
-  auto_scaling_enabled = true
-  min_count            = each.value.min_count
-  max_count            = each.value.max_count
+  auto_scaling_enabled = each.value.min_size != each.value.max_size
+  min_count            = each.value.min_size != each.value.max_size ? each.value.min_size : null
+  max_count            = each.value.min_size != each.value.max_size ? each.value.max_size : null
+  node_count           = each.value.min_size != each.value.max_size ? null : each.value.min_size
 
   # Node pool configuration
   mode            = "User"
   os_type         = "Linux"
   os_disk_type    = "Managed"
-  os_disk_size_gb = each.value.os_disk_size_gb
+  os_disk_size_gb = each.value.disk_size
 
   # VNet integration
   vnet_subnet_id = local.aks_subnet_id

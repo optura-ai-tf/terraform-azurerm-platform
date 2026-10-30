@@ -33,6 +33,7 @@ resource "azurerm_storage_account" "logging" {
   account_replication_type        = "LRS"
   min_tls_version                 = "TLS1_2"
   allow_nested_items_to_be_public = false
+  public_network_access_enabled   = var.storage_public_network_access_enabled
 
   # Customer-managed key encryption
   dynamic "identity" {
@@ -141,6 +142,7 @@ resource "azurerm_storage_account" "storage" {
   account_replication_type        = "LRS"
   min_tls_version                 = "TLS1_2"
   allow_nested_items_to_be_public = false
+  public_network_access_enabled   = var.storage_public_network_access_enabled
 
   # Customer-managed key encryption
   dynamic "identity" {
@@ -244,19 +246,23 @@ resource "azurerm_storage_management_policy" "storage" {
   }
 }
 
-# Private endpoint + privatelink DNS zone for the blob endpoint. Lets
+# Private endpoints + privatelink DNS zone for the blob endpoints. Lets
 # in-cluster traffic resolve <account>.blob.core.windows.net to the PE's
 # private IP and stay on the Azure backbone (no NAT egress, no internet
-# hop). The storage account itself remains publicly reachable — auth is
-# the gate — so external clients (CI, ops laptops) still work.
+# hop). The accounts stay publicly reachable unless
+# `storage_public_network_access_enabled = false`.
 #
-# Disable via `storage_general_private_endpoint_enabled = false` when
-# `create_vnet = false` and your environment manages
-# privatelink.blob.core.windows.net centrally (Azure rejects multiple
-# zone links of the same name on a single VNet).
+# Disable the private endpoints when `create_vnet = false` and your
+# environment manages privatelink.blob.core.windows.net centrally (Azure
+# rejects multiple zone links of the same name on a single VNet).
+
+locals {
+  storage_general_pe_enabled = var.storage_general_enabled && var.storage_general_private_endpoint_enabled
+  storage_logging_pe_enabled = var.storage_logging_enabled && var.storage_logging_private_endpoint_enabled
+}
 
 resource "azurerm_private_dns_zone" "blob" {
-  count               = var.storage_general_enabled && var.storage_general_private_endpoint_enabled ? 1 : 0
+  count               = local.storage_general_pe_enabled || local.storage_logging_pe_enabled ? 1 : 0
   name                = "privatelink.blob.core.windows.net"
   resource_group_name = azurerm_resource_group.main.name
 
@@ -264,7 +270,7 @@ resource "azurerm_private_dns_zone" "blob" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "blob" {
-  count                 = var.storage_general_enabled && var.storage_general_private_endpoint_enabled ? 1 : 0
+  count                 = local.storage_general_pe_enabled || local.storage_logging_pe_enabled ? 1 : 0
   name                  = "blob-${local.name_prefix}-vnet-link"
   resource_group_name   = azurerm_resource_group.main.name
   private_dns_zone_name = azurerm_private_dns_zone.blob[0].name
@@ -275,7 +281,7 @@ resource "azurerm_private_dns_zone_virtual_network_link" "blob" {
 }
 
 resource "azurerm_private_endpoint" "storage_blob" {
-  count               = var.storage_general_enabled && var.storage_general_private_endpoint_enabled ? 1 : 0
+  count               = local.storage_general_pe_enabled ? 1 : 0
   name                = "pe-${local.name_prefix}-storage-blob"
   resource_group_name = azurerm_resource_group.main.name
   location            = var.region
@@ -284,6 +290,28 @@ resource "azurerm_private_endpoint" "storage_blob" {
   private_service_connection {
     name                           = "psc-${local.name_prefix}-storage-blob"
     private_connection_resource_id = azurerm_storage_account.storage[0].id
+    is_manual_connection           = false
+    subresource_names              = ["blob"]
+  }
+
+  private_dns_zone_group {
+    name                 = "blob-dns-zone-group"
+    private_dns_zone_ids = [azurerm_private_dns_zone.blob[0].id]
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_private_endpoint" "storage_logging_blob" {
+  count               = local.storage_logging_pe_enabled ? 1 : 0
+  name                = "pe-${local.name_prefix}-logging-blob"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.region
+  subnet_id           = local.aks_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${local.name_prefix}-logging-blob"
+    private_connection_resource_id = azurerm_storage_account.logging[0].id
     is_manual_connection           = false
     subresource_names              = ["blob"]
   }

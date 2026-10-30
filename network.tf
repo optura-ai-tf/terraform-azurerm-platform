@@ -55,6 +55,19 @@ resource "azurerm_subnet" "appgw" {
   virtual_network_name = local.vnet_name
   address_prefixes     = [var.appgw_subnet_address_prefix]
 
+  # AGIC with Azure CNI Overlay and a private-only App Gateway both require the
+  # subnet delegated to Microsoft.Network/applicationGateways.
+  dynamic "delegation" {
+    for_each = var.pod_cidr != null || local.appgw_private_enabled ? [1] : []
+    content {
+      name = "appgw-delegation"
+      service_delegation {
+        name    = "Microsoft.Network/applicationGateways"
+        actions = ["Microsoft.Network/virtualNetworks/subnets/join/action"]
+      }
+    }
+  }
+
   depends_on = [
     azurerm_virtual_network.main
   ]
