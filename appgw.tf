@@ -117,6 +117,17 @@ resource "azurerm_application_gateway" "main" {
     max_capacity = var.appgw_capacity_max
   }
 
+  # TLS policy; Azure default when null
+  dynamic "ssl_policy" {
+    for_each = var.appgw_ssl_policy != null ? [var.appgw_ssl_policy] : []
+    content {
+      policy_type          = ssl_policy.value.policy_type
+      policy_name          = ssl_policy.value.policy_name
+      min_protocol_version = ssl_policy.value.min_protocol_version
+      cipher_suites        = ssl_policy.value.cipher_suites
+    }
+  }
+
   # Managed identity for AGIC integration
   identity {
     type = "UserAssigned"

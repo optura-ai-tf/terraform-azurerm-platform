@@ -122,6 +122,11 @@ output "database_endpoints" {
   value       = { for k, s in azurerm_postgresql_flexible_server.main : k => s.fqdn }
 }
 
+output "database_server_ids" {
+  description = "Resource ID of each named PostgreSQL Flexible Server, keyed by database name (for diagnostic settings)"
+  value       = { for k, s in azurerm_postgresql_flexible_server.main : k => s.id }
+}
+
 output "database_names" {
   description = "Initial database name for each named PostgreSQL server"
   value       = { for k, d in azurerm_postgresql_flexible_server_database.main : k => d.name }
@@ -192,6 +197,13 @@ output "key_vault_id" {
 output "key_vault_uri" {
   description = "URI of the Azure Key Vault"
   value       = var.enable_cmk ? azurerm_key_vault.main[0].vault_uri : null
+}
+
+# ===== Foundry =====
+
+output "foundry_account_id" {
+  description = "Resource ID of the Azure AI Foundry account (null when foundry_enabled = false)"
+  value       = var.foundry_enabled ? azurerm_cognitive_account.foundry[0].id : null
 }
 
 # ===== Storage Outputs =====

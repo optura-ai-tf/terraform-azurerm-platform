@@ -16,14 +16,16 @@ locals {
   #   - Foundry disabled: null (the PE is never created).
   # Split into two locals so the precedence reads top-to-bottom instead of as a
   # nested ternary.
-  _foundry_local_dns_zone_id = var.foundry_enabled && !var.foundry_private_dns_managed_externally ? azurerm_private_dns_zone.foundry[0].id : null
-  foundry_dns_zone_id        = var.foundry_private_dns_managed_externally ? var.foundry_existing_private_dns_zone_id : local._foundry_local_dns_zone_id
+  foundry_dns_external       = var.foundry_private_dns_managed_externally || var.private_dns_zones_managed_externally
+  _foundry_local_dns_zone_id = var.foundry_enabled && !local.foundry_dns_external ? azurerm_private_dns_zone.foundry[0].id : null
+  foundry_dns_zone_id        = local.foundry_dns_external ? try(coalesce(var.foundry_existing_private_dns_zone_id, var.existing_private_dns_zone_ids.foundry), null) : local._foundry_local_dns_zone_id
+  foundry_policy_dns         = local.foundry_dns_external && try(coalesce(var.foundry_existing_private_dns_zone_id, var.existing_private_dns_zone_ids.foundry), null) == null
 }
 
 # ===== Private DNS for AIServices accounts =====
 
 resource "azurerm_private_dns_zone" "foundry" {
-  count               = (var.foundry_enabled && !var.foundry_private_dns_managed_externally) ? 1 : 0
+  count               = (var.foundry_enabled && !local.foundry_dns_external) ? 1 : 0
   name                = "privatelink.services.ai.azure.com"
   resource_group_name = azurerm_resource_group.main.name
 
@@ -31,7 +33,7 @@ resource "azurerm_private_dns_zone" "foundry" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "foundry" {
-  count = (var.foundry_enabled && !var.foundry_private_dns_managed_externally) ? 1 : 0
+  count = (var.foundry_enabled && !local.foundry_dns_external) ? 1 : 0
   # Name preserves the original module-era convention (`foundry-${name_prefix}-vnet-link`)
   # so existing deployments don't see a destroy+recreate. `name` is ForceNew
   # on this resource — a rename would unlink the zone from the VNet during
@@ -95,11 +97,11 @@ resource "time_sleep" "wait_for_foundry_account" {
 # ===== Private endpoint =====
 
 resource "azurerm_private_endpoint" "foundry" {
-  count               = var.foundry_enabled ? 1 : 0
+  count               = var.foundry_enabled && !local.foundry_policy_dns ? 1 : 0
   name                = "pe-${local.foundry_account_name}"
   resource_group_name = azurerm_resource_group.main.name
   location            = azurerm_resource_group.main.location
-  subnet_id           = local.aks_subnet_id
+  subnet_id           = local.private_endpoint_subnet_id
 
   private_service_connection {
     name                           = "psc-${local.foundry_account_name}"
@@ -108,16 +110,33 @@ resource "azurerm_private_endpoint" "foundry" {
     subresource_names              = ["account"]
   }
 
-  # Omit the DNS zone group entirely when foundry_dns_zone_id is null — i.e. the
-  # privatelink zone is managed externally with no supplied external zone ID, so
-  # central policy/DINE registers the endpoint's A record. Otherwise register the
-  # PE into the resolved zone (locally created or externally supplied).
-  dynamic "private_dns_zone_group" {
-    for_each = local.foundry_dns_zone_id != null ? [1] : []
-    content {
-      name                 = "foundry-dns-zone-group"
-      private_dns_zone_ids = [local.foundry_dns_zone_id]
-    }
+  private_dns_zone_group {
+    name                 = "foundry-dns-zone-group"
+    private_dns_zone_ids = [local.foundry_dns_zone_id]
+  }
+
+  depends_on = [time_sleep.wait_for_foundry_account]
+
+  tags = local.common_tags
+}
+
+# See azurerm_private_endpoint.acr_policy_dns: policy-managed DNS zone group.
+resource "azurerm_private_endpoint" "foundry_policy_dns" {
+  count               = var.foundry_enabled && local.foundry_policy_dns ? 1 : 0
+  name                = "pe-${local.foundry_account_name}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${local.foundry_account_name}"
+    private_connection_resource_id = azurerm_cognitive_account.foundry[0].id
+    is_manual_connection           = false
+    subresource_names              = ["account"]
+  }
+
+  lifecycle {
+    ignore_changes = [private_dns_zone_group]
   }
 
   depends_on = [time_sleep.wait_for_foundry_account]

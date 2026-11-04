@@ -37,18 +37,28 @@ resource "azurerm_role_assignment" "agic_identity_operator" {
 }
 
 # AKS cluster identity -> Network Contributor on AKS subnet (if we created the VNet)
+# System-assigned: the principal exists only after the cluster, so grant afterwards.
 resource "azurerm_role_assignment" "aks_network" {
-  count                = var.create_vnet ? 1 : 0
-  principal_id         = azurerm_kubernetes_cluster.main.identity[0].principal_id
+  count                = var.create_vnet && var.aks_identity_id == null ? 1 : 0
+  principal_id         = local.aks_identity_principal_id
   role_definition_name = "Network Contributor"
   scope                = local.aks_subnet_id
+}
+
+# User-assigned: grant before the cluster exists; AKS checks it at create time.
+# A custom API zone needs VNet scope: AKS links the zone to the VNet (join/action).
+resource "azurerm_role_assignment" "aks_network_uai" {
+  count                = var.create_vnet && var.aks_identity_id != null ? 1 : 0
+  principal_id         = local.aks_uai_principal_id
+  role_definition_name = "Network Contributor"
+  scope                = !contains(["System", "None"], coalesce(var.aks_private_dns_zone_id, "System")) ? local.vnet_id : local.aks_subnet_id
 }
 
 # AKS cluster identity -> Reader on Disk Encryption Set
 # Required for AKS control plane to manage disk encryption
 resource "azurerm_role_assignment" "aks_des_reader" {
   count                = var.enable_cmk ? 1 : 0
-  principal_id         = azurerm_kubernetes_cluster.main.identity[0].principal_id
+  principal_id         = local.aks_identity_principal_id
   role_definition_name = "Reader"
   scope                = azurerm_disk_encryption_set.aks[0].id
 }

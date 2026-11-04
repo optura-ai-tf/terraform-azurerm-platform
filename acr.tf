@@ -89,8 +89,13 @@ resource "azurerm_container_registry" "main" {
 
 # Private endpoint + privatelink DNS zone. The zone group registers both the
 # login server and the regional data endpoint, so image pulls stay private.
+locals {
+  acr_dns_zone_id = var.private_dns_zones_managed_externally ? var.existing_private_dns_zone_ids.acr : try(azurerm_private_dns_zone.acr[0].id, null)
+  acr_policy_dns  = var.private_dns_zones_managed_externally && var.existing_private_dns_zone_ids.acr == null
+}
+
 resource "azurerm_private_dns_zone" "acr" {
-  count               = var.registry_enabled && var.acr_private_endpoint_enabled ? 1 : 0
+  count               = var.registry_enabled && var.acr_private_endpoint_enabled && !var.private_dns_zones_managed_externally ? 1 : 0
   name                = "privatelink.azurecr.io"
   resource_group_name = azurerm_resource_group.main.name
 
@@ -98,7 +103,7 @@ resource "azurerm_private_dns_zone" "acr" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "acr" {
-  count                 = var.registry_enabled && var.acr_private_endpoint_enabled ? 1 : 0
+  count                 = var.registry_enabled && var.acr_private_endpoint_enabled && !var.private_dns_zones_managed_externally ? 1 : 0
   name                  = "acr-${local.name_prefix}-vnet-link"
   resource_group_name   = azurerm_resource_group.main.name
   private_dns_zone_name = azurerm_private_dns_zone.acr[0].name
@@ -109,11 +114,11 @@ resource "azurerm_private_dns_zone_virtual_network_link" "acr" {
 }
 
 resource "azurerm_private_endpoint" "acr" {
-  count               = var.registry_enabled && var.acr_private_endpoint_enabled ? 1 : 0
+  count               = var.registry_enabled && var.acr_private_endpoint_enabled && !local.acr_policy_dns ? 1 : 0
   name                = "pe-${local.resource_names.acr}"
   resource_group_name = azurerm_resource_group.main.name
   location            = azurerm_resource_group.main.location
-  subnet_id           = local.aks_subnet_id
+  subnet_id           = local.private_endpoint_subnet_id
 
   private_service_connection {
     name                           = "psc-${local.resource_names.acr}"
@@ -124,7 +129,32 @@ resource "azurerm_private_endpoint" "acr" {
 
   private_dns_zone_group {
     name                 = "acr-dns-zone-group"
-    private_dns_zone_ids = [azurerm_private_dns_zone.acr[0].id]
+    private_dns_zone_ids = [local.acr_dns_zone_id]
+  }
+
+  tags = local.common_tags
+}
+
+# Zone external and no ID given: central (DINE) policy adds the zone group.
+# ignore_changes keeps the next plan from removing it. ignore_changes can't be
+# conditional, so this is a sibling resource; switching a service between
+# policy and module DNS recreates its endpoint (new IP).
+resource "azurerm_private_endpoint" "acr_policy_dns" {
+  count               = var.registry_enabled && var.acr_private_endpoint_enabled && local.acr_policy_dns ? 1 : 0
+  name                = "pe-${local.resource_names.acr}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${local.resource_names.acr}"
+    private_connection_resource_id = azurerm_container_registry.main[0].id
+    is_manual_connection           = false
+    subresource_names              = ["registry"]
+  }
+
+  lifecycle {
+    ignore_changes = [private_dns_zone_group]
   }
 
   tags = local.common_tags

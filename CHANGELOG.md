@@ -6,6 +6,71 @@ form `azure/platform/vX.Y.Z`.
 
 ## Unreleased
 
+## 1.1.0 — 2026-11-04
+
+Release as **1.1.0** (Version Bump workflow, `minor`). Every new input is
+optional and defaults to the 1.0.0 behaviour, so existing workspaces plan no
+changes, with two exceptions: the upgrade channel under Changed and the
+Foundry note under Fixed.
+
+### Added
+
+- `existing_private_endpoint_subnet_id`: a dedicated subnet for the ACR,
+  Foundry, Key Vault, and storage private endpoints. Default: the AKS subnet.
+- `log_analytics_workspace_id`: Container Insights on the AKS cluster. The
+  module creates the data collection rule and its association. Set
+  `log_analytics_workspace_location` when the workspace is in another region.
+- `azure_policy_enabled`: the Azure Policy add-on (Gatekeeper).
+- `appgw_ssl_policy`: App Gateway TLS policy (predefined or `CustomV2`).
+- `storage_replication_type`, `storage_delete_retention_days`,
+  `key_vault_soft_delete_retention_days`: replication and soft-delete retention,
+  previously fixed at `LRS` and 7 days.
+- Outputs `database_server_ids` and `foundry_account_id`, so callers can attach
+  diagnostic settings to every resource.
+- `private_dns_zones_managed_externally` and `existing_private_dns_zone_ids`:
+  use central (hub) private DNS zones for blob, Key Vault, ACR, Foundry, and
+  PostgreSQL. A null zone ID skips the zone group so central policy registers
+  the record. The Foundry-only inputs still work.
+- `postgresql_network_mode = "private_endpoint"`: PostgreSQL over a private
+  endpoint with `privatelink.postgres.database.azure.com`, no delegated subnet.
+  Default `vnet_integration`.
+- `aks_private_dns_zone_id` and `aks_identity_id`: a customer-owned private
+  API zone (or `"None"`), with a user-assigned control-plane identity.
+  `aks_identity_principal_id` covers an identity in another subscription.
+
+### Changed
+
+- `aks_automatic_upgrade_channel` (default `"patch"`): AKS now applies patch
+  releases automatically, weekly on Sunday 02:00–06:00 UTC. Existing clusters
+  plan an in-place update. Set it to `null` to keep upgrades manual.
+- `kubernetes_version` must be a minor version (for example `1.35`) while the
+  channel is set. If you pin a patch version (for example `1.34.7`), drop the
+  patch component or set `aks_automatic_upgrade_channel = null` before you
+  upgrade, or the plan fails.
+
+### Fixed
+
+- A private endpoint whose DNS zone is external with no zone ID no longer
+  loses the zone group that central (deploy-if-not-exists) policy adds: the
+  next plan removed it and broke name resolution. These endpoints are now
+  separate `*_policy_dns` resources with `ignore_changes` on the zone group.
+  A Foundry workspace with `foundry_private_dns_managed_externally = true` and
+  no zone ID recreates its private endpoint once (new IP). To avoid this, add
+  a `moved` block in the root module before you upgrade:
+
+  ```hcl
+  moved {
+    from = module.<name>.azurerm_private_endpoint.foundry[0]
+    to   = module.<name>.azurerm_private_endpoint.foundry_policy_dns[0]
+  }
+  ```
+
+  A matching `moved` block between `<resource>` and `<resource>_policy_dns`
+  (same index or key) also avoids the recreation when you later switch a DNS
+  zone entry between a zone ID and `null`.
+- The `availability_zones` description no longer claims East US 2 has only
+  zones 1 and 3. Zone restrictions are per VM size and subscription.
+
 ## 1.0.0 — 2026-10-30
 
 ### Breaking changes

@@ -5,9 +5,19 @@ data "azuread_group" "aks_admins" {
   security_enabled = true
 }
 
+# Only looks in the provider's subscription; set aks_identity_principal_id for
+# an identity in another subscription.
+data "azurerm_user_assigned_identity" "aks" {
+  count               = var.aks_identity_id != null && var.aks_identity_principal_id == null ? 1 : 0
+  name                = split("/", var.aks_identity_id)[8]
+  resource_group_name = split("/", var.aks_identity_id)[4]
+}
+
 locals {
-  system_pool = var.node_groups["system"]
-  user_pools  = { for k, v in var.node_groups : k => v if k != "system" }
+  aks_uai_principal_id      = var.aks_identity_id == null ? null : coalesce(var.aks_identity_principal_id, one(data.azurerm_user_assigned_identity.aks[*].principal_id))
+  aks_identity_principal_id = var.aks_identity_id != null ? local.aks_uai_principal_id : azurerm_kubernetes_cluster.main.identity[0].principal_id
+  system_pool               = var.node_groups["system"]
+  user_pools                = { for k, v in var.node_groups : k => v if k != "system" }
   # Keep in sync with the node_groups rotation name validation.
   rotation_names = {
     for k, v in var.node_groups : k => coalesce(v.temporary_name_for_rotation, "${substr(k, 0, 9)}tmp")
@@ -23,11 +33,18 @@ resource "azurerm_kubernetes_cluster" "main" {
   dns_prefix          = local.resource_names.aks
   kubernetes_version  = var.kubernetes_version
 
+  # "patch" stays within the pinned minor version, so it causes no drift.
+  # Upgrades run in the maintenance_window_auto_upgrade window below.
+  automatic_upgrade_channel = var.aks_automatic_upgrade_channel
+
   # Standard tier for 99.95% SLA with Availability Zones
   sku_tier = "Standard"
 
   # Private cluster configuration
   private_cluster_enabled = var.private_cluster_enabled
+  private_dns_zone_id     = var.aks_private_dns_zone_id
+  # AKS rejects privateDNSZone = None unless the public FQDN is enabled.
+  private_cluster_public_fqdn_enabled = var.aks_private_dns_zone_id == "None"
 
   # System node pool (tainted for system workloads only)
   default_node_pool {
@@ -77,9 +94,11 @@ resource "azurerm_kubernetes_cluster" "main" {
     dns_service_ip = var.dns_service_ip
   }
 
-  # System-assigned managed identity
+  # System-assigned by default. A customer-owned private DNS zone needs a
+  # user-assigned identity with rights on the zone before the cluster exists.
   identity {
-    type = "SystemAssigned"
+    type         = var.aks_identity_id != null ? "UserAssigned" : "SystemAssigned"
+    identity_ids = var.aks_identity_id != null ? [var.aks_identity_id] : null
   }
 
   # Enable OIDC issuer for Workload Identity
@@ -118,11 +137,36 @@ resource "azurerm_kubernetes_cluster" "main" {
     gateway_id = azurerm_application_gateway.main.id
   }
 
+  # Container Insights
+  dynamic "oms_agent" {
+    for_each = var.log_analytics_workspace_id != null ? [1] : []
+    content {
+      log_analytics_workspace_id      = var.log_analytics_workspace_id
+      msi_auth_for_monitoring_enabled = true
+    }
+  }
+
+  azure_policy_enabled = var.azure_policy_enabled
+
   # Maintenance window
   maintenance_window {
     allowed {
       day   = "Sunday"
       hours = [2, 3, 4]
+    }
+  }
+
+  # The window above does not apply to automatic upgrades; this one does.
+  # AKS requires a duration of 4 hours or more.
+  dynamic "maintenance_window_auto_upgrade" {
+    for_each = var.aks_automatic_upgrade_channel != null ? [1] : []
+    content {
+      frequency   = "Weekly"
+      interval    = 1
+      day_of_week = "Sunday"
+      start_time  = "02:00"
+      duration    = 4
+      utc_offset  = "+00:00"
     }
   }
 
@@ -147,6 +191,52 @@ resource "azurerm_kubernetes_cluster" "main" {
   # Note: Role assignments depend on this cluster's AGIC identity
   # Terraform handles dependency order automatically via implicit dependencies
   depends_on = [
-    azurerm_application_gateway.main
+    azurerm_application_gateway.main,
+    azurerm_role_assignment.aks_network_uai
   ]
+}
+
+# Container Insights with MSI auth needs a data collection rule and its
+# association; az CLI and the portal create these, azurerm does not.
+resource "azurerm_monitor_data_collection_rule" "container_insights" {
+  count               = var.log_analytics_workspace_id != null ? 1 : 0
+  name                = "MSCI-${local.resource_names.aks}"
+  location            = coalesce(var.log_analytics_workspace_location, azurerm_resource_group.main.location)
+  resource_group_name = azurerm_resource_group.main.name
+
+  destinations {
+    log_analytics {
+      name                  = "ciworkspace"
+      workspace_resource_id = var.log_analytics_workspace_id
+    }
+  }
+
+  data_flow {
+    streams      = ["Microsoft-ContainerInsights-Group-Default"]
+    destinations = ["ciworkspace"]
+  }
+
+  data_sources {
+    extension {
+      name           = "ContainerInsightsExtension"
+      extension_name = "ContainerInsights"
+      streams        = ["Microsoft-ContainerInsights-Group-Default"]
+      extension_json = jsonencode({
+        dataCollectionSettings = {
+          interval               = "1m"
+          namespaceFilteringMode = "Off"
+          enableContainerLogV2   = true
+        }
+      })
+    }
+  }
+
+  tags = local.common_tags
+}
+
+resource "azurerm_monitor_data_collection_rule_association" "container_insights" {
+  count                   = var.log_analytics_workspace_id != null ? 1 : 0
+  name                    = "ContainerInsightsExtension"
+  target_resource_id      = azurerm_kubernetes_cluster.main.id
+  data_collection_rule_id = azurerm_monitor_data_collection_rule.container_insights[0].id
 }

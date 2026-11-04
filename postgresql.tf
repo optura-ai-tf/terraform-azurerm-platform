@@ -44,10 +44,18 @@ resource "random_password" "postgresql_admin" {
   special  = true
 }
 
+locals {
+  postgresql_private_endpoint = var.postgresql_network_mode == "private_endpoint"
+  postgresql_dns_zone_id      = var.private_dns_zones_managed_externally ? var.existing_private_dns_zone_ids.postgresql : try(azurerm_private_dns_zone.postgresql[0].id, null)
+  postgresql_policy_dns       = var.private_dns_zones_managed_externally && var.existing_private_dns_zone_ids.postgresql == null
+}
+
 # Private DNS Zone for PostgreSQL (shared across all named servers).
+# VNet integration accepts any *.postgres.database.azure.com zone; a private
+# endpoint needs the privatelink zone.
 resource "azurerm_private_dns_zone" "postgresql" {
-  count               = var.postgresql_enabled ? 1 : 0
-  name                = "${var.environment}.postgres.database.azure.com"
+  count               = var.postgresql_enabled && !var.private_dns_zones_managed_externally ? 1 : 0
+  name                = local.postgresql_private_endpoint ? "privatelink.postgres.database.azure.com" : "${var.environment}.postgres.database.azure.com"
   resource_group_name = azurerm_resource_group.main.name
 
   tags = local.common_tags
@@ -55,7 +63,7 @@ resource "azurerm_private_dns_zone" "postgresql" {
 
 # Link Private DNS Zone to VNet (shared across all named servers).
 resource "azurerm_private_dns_zone_virtual_network_link" "postgresql" {
-  count                 = var.postgresql_enabled ? 1 : 0
+  count                 = var.postgresql_enabled && !var.private_dns_zones_managed_externally ? 1 : 0
   name                  = "postgresql-vnet-link"
   resource_group_name   = azurerm_resource_group.main.name
   private_dns_zone_name = azurerm_private_dns_zone.postgresql[0].name
@@ -154,9 +162,9 @@ resource "azurerm_postgresql_flexible_server" "main" {
     start_minute = 0
   }
 
-  # VNet integration
-  delegated_subnet_id = local.postgresql_subnet_id
-  private_dns_zone_id = azurerm_private_dns_zone.postgresql[0].id
+  # VNet integration; with a private endpoint the server has neither (see below)
+  delegated_subnet_id = local.postgresql_private_endpoint ? null : local.postgresql_subnet_id
+  private_dns_zone_id = local.postgresql_private_endpoint ? null : local.postgresql_dns_zone_id
 
   # Authentication
   authentication {
@@ -181,6 +189,51 @@ resource "azurerm_postgresql_flexible_server" "main" {
     azurerm_private_dns_zone_virtual_network_link.postgresql,
     azurerm_role_assignment.kv_crypto_postgresql
   ]
+}
+
+# Private endpoint per server (postgresql_network_mode = "private_endpoint").
+resource "azurerm_private_endpoint" "postgresql" {
+  for_each            = var.postgresql_enabled && local.postgresql_private_endpoint && !local.postgresql_policy_dns ? var.databases : {}
+  name                = "pe-${azurerm_postgresql_flexible_server.main[each.key].name}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${azurerm_postgresql_flexible_server.main[each.key].name}"
+    private_connection_resource_id = azurerm_postgresql_flexible_server.main[each.key].id
+    is_manual_connection           = false
+    subresource_names              = ["postgresqlServer"]
+  }
+
+  private_dns_zone_group {
+    name                 = "postgresql-dns-zone-group"
+    private_dns_zone_ids = [local.postgresql_dns_zone_id]
+  }
+
+  tags = local.common_tags
+}
+
+# See azurerm_private_endpoint.acr_policy_dns: policy-managed DNS zone group.
+resource "azurerm_private_endpoint" "postgresql_policy_dns" {
+  for_each            = var.postgresql_enabled && local.postgresql_private_endpoint && local.postgresql_policy_dns ? var.databases : {}
+  name                = "pe-${azurerm_postgresql_flexible_server.main[each.key].name}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${azurerm_postgresql_flexible_server.main[each.key].name}"
+    private_connection_resource_id = azurerm_postgresql_flexible_server.main[each.key].id
+    is_manual_connection           = false
+    subresource_names              = ["postgresqlServer"]
+  }
+
+  lifecycle {
+    ignore_changes = [private_dns_zone_group]
+  }
+
+  tags = local.common_tags
 }
 
 # Initial database (one per server).
@@ -593,6 +646,8 @@ resource "kubernetes_job_v1" "postgresql_ad_bootstrap" {
     azurerm_kubernetes_cluster.main,
     azurerm_postgresql_flexible_server.main,
     azurerm_postgresql_flexible_server_database.main,
+    azurerm_private_endpoint.postgresql,
+    azurerm_private_endpoint.postgresql_policy_dns,
     kubectl_manifest.postgresql_ad_setup,
     kubectl_manifest.postgresql_bootstrap_creds,
     azurerm_postgresql_flexible_server_active_directory_administrator.teleport,

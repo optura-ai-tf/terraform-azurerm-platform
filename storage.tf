@@ -30,7 +30,7 @@ resource "azurerm_storage_account" "logging" {
   resource_group_name             = azurerm_resource_group.main.name
   location                        = var.region
   account_tier                    = "Standard"
-  account_replication_type        = "LRS"
+  account_replication_type        = var.storage_replication_type
   min_tls_version                 = "TLS1_2"
   allow_nested_items_to_be_public = false
   public_network_access_enabled   = var.storage_public_network_access_enabled
@@ -56,10 +56,10 @@ resource "azurerm_storage_account" "logging" {
 
   blob_properties {
     delete_retention_policy {
-      days = 7
+      days = var.storage_delete_retention_days
     }
     container_delete_retention_policy {
-      days = 7
+      days = var.storage_delete_retention_days
     }
   }
 
@@ -99,8 +99,9 @@ resource "azurerm_storage_management_policy" "logging" {
 
     actions {
       base_blob {
-        tier_to_cool_after_days_since_modification_greater_than    = var.storage_logging_lifecycle.transition_to_cool_days
-        tier_to_archive_after_days_since_modification_greater_than = var.storage_logging_lifecycle.transition_to_archive_days
+        tier_to_cool_after_days_since_modification_greater_than = var.storage_logging_lifecycle.transition_to_cool_days
+        # Azure has no archive tier for zone-redundant replication (ZRS, GZRS, RAGZRS).
+        tier_to_archive_after_days_since_modification_greater_than = contains(["ZRS", "GZRS", "RAGZRS"], var.storage_replication_type) ? null : var.storage_logging_lifecycle.transition_to_archive_days
         delete_after_days_since_modification_greater_than          = var.storage_logging_lifecycle.expiration_days
       }
     }
@@ -139,7 +140,7 @@ resource "azurerm_storage_account" "storage" {
   resource_group_name             = azurerm_resource_group.main.name
   location                        = var.region
   account_tier                    = "Standard"
-  account_replication_type        = "LRS"
+  account_replication_type        = var.storage_replication_type
   min_tls_version                 = "TLS1_2"
   allow_nested_items_to_be_public = false
   public_network_access_enabled   = var.storage_public_network_access_enabled
@@ -181,10 +182,10 @@ resource "azurerm_storage_account" "storage" {
     }
 
     delete_retention_policy {
-      days = 7
+      days = var.storage_delete_retention_days
     }
     container_delete_retention_policy {
-      days = 7
+      days = var.storage_delete_retention_days
     }
   }
 
@@ -252,17 +253,19 @@ resource "azurerm_storage_management_policy" "storage" {
 # hop). The accounts stay publicly reachable unless
 # `storage_public_network_access_enabled = false`.
 #
-# Disable the private endpoints when `create_vnet = false` and your
-# environment manages privatelink.blob.core.windows.net centrally (Azure
-# rejects multiple zone links of the same name on a single VNet).
+# When your environment manages privatelink.blob.core.windows.net centrally,
+# set private_dns_zones_managed_externally (Azure rejects multiple zone links
+# of the same name on a single VNet).
 
 locals {
   storage_general_pe_enabled = var.storage_general_enabled && var.storage_general_private_endpoint_enabled
   storage_logging_pe_enabled = var.storage_logging_enabled && var.storage_logging_private_endpoint_enabled
+  blob_dns_zone_id           = var.private_dns_zones_managed_externally ? var.existing_private_dns_zone_ids.blob : try(azurerm_private_dns_zone.blob[0].id, null)
+  blob_policy_dns            = var.private_dns_zones_managed_externally && var.existing_private_dns_zone_ids.blob == null
 }
 
 resource "azurerm_private_dns_zone" "blob" {
-  count               = local.storage_general_pe_enabled || local.storage_logging_pe_enabled ? 1 : 0
+  count               = (local.storage_general_pe_enabled || local.storage_logging_pe_enabled) && !var.private_dns_zones_managed_externally ? 1 : 0
   name                = "privatelink.blob.core.windows.net"
   resource_group_name = azurerm_resource_group.main.name
 
@@ -270,7 +273,7 @@ resource "azurerm_private_dns_zone" "blob" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "blob" {
-  count                 = local.storage_general_pe_enabled || local.storage_logging_pe_enabled ? 1 : 0
+  count                 = (local.storage_general_pe_enabled || local.storage_logging_pe_enabled) && !var.private_dns_zones_managed_externally ? 1 : 0
   name                  = "blob-${local.name_prefix}-vnet-link"
   resource_group_name   = azurerm_resource_group.main.name
   private_dns_zone_name = azurerm_private_dns_zone.blob[0].name
@@ -281,11 +284,11 @@ resource "azurerm_private_dns_zone_virtual_network_link" "blob" {
 }
 
 resource "azurerm_private_endpoint" "storage_blob" {
-  count               = local.storage_general_pe_enabled ? 1 : 0
+  count               = local.storage_general_pe_enabled && !local.blob_policy_dns ? 1 : 0
   name                = "pe-${local.name_prefix}-storage-blob"
   resource_group_name = azurerm_resource_group.main.name
   location            = var.region
-  subnet_id           = local.aks_subnet_id
+  subnet_id           = local.private_endpoint_subnet_id
 
   private_service_connection {
     name                           = "psc-${local.name_prefix}-storage-blob"
@@ -296,18 +299,40 @@ resource "azurerm_private_endpoint" "storage_blob" {
 
   private_dns_zone_group {
     name                 = "blob-dns-zone-group"
-    private_dns_zone_ids = [azurerm_private_dns_zone.blob[0].id]
+    private_dns_zone_ids = [local.blob_dns_zone_id]
+  }
+
+  tags = local.common_tags
+}
+
+# See azurerm_private_endpoint.acr_policy_dns: policy-managed DNS zone group.
+resource "azurerm_private_endpoint" "storage_blob_policy_dns" {
+  count               = local.storage_general_pe_enabled && local.blob_policy_dns ? 1 : 0
+  name                = "pe-${local.name_prefix}-storage-blob"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.region
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${local.name_prefix}-storage-blob"
+    private_connection_resource_id = azurerm_storage_account.storage[0].id
+    is_manual_connection           = false
+    subresource_names              = ["blob"]
+  }
+
+  lifecycle {
+    ignore_changes = [private_dns_zone_group]
   }
 
   tags = local.common_tags
 }
 
 resource "azurerm_private_endpoint" "storage_logging_blob" {
-  count               = local.storage_logging_pe_enabled ? 1 : 0
+  count               = local.storage_logging_pe_enabled && !local.blob_policy_dns ? 1 : 0
   name                = "pe-${local.name_prefix}-logging-blob"
   resource_group_name = azurerm_resource_group.main.name
   location            = var.region
-  subnet_id           = local.aks_subnet_id
+  subnet_id           = local.private_endpoint_subnet_id
 
   private_service_connection {
     name                           = "psc-${local.name_prefix}-logging-blob"
@@ -318,7 +343,29 @@ resource "azurerm_private_endpoint" "storage_logging_blob" {
 
   private_dns_zone_group {
     name                 = "blob-dns-zone-group"
-    private_dns_zone_ids = [azurerm_private_dns_zone.blob[0].id]
+    private_dns_zone_ids = [local.blob_dns_zone_id]
+  }
+
+  tags = local.common_tags
+}
+
+# See azurerm_private_endpoint.acr_policy_dns: policy-managed DNS zone group.
+resource "azurerm_private_endpoint" "storage_logging_blob_policy_dns" {
+  count               = local.storage_logging_pe_enabled && local.blob_policy_dns ? 1 : 0
+  name                = "pe-${local.name_prefix}-logging-blob"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = var.region
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${local.name_prefix}-logging-blob"
+    private_connection_resource_id = azurerm_storage_account.logging[0].id
+    is_manual_connection           = false
+    subresource_names              = ["blob"]
+  }
+
+  lifecycle {
+    ignore_changes = [private_dns_zone_group]
   }
 
   tags = local.common_tags

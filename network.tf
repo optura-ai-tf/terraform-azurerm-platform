@@ -25,7 +25,10 @@ locals {
   # Subnet IDs normalized across creation modes (BYO subnets when create_vnet = false)
   aks_subnet_id        = var.create_vnet ? azurerm_subnet.aks[0].id : var.existing_aks_subnet_id
   appgw_subnet_id      = var.create_vnet ? azurerm_subnet.appgw[0].id : var.existing_appgw_subnet_id
-  postgresql_subnet_id = var.create_vnet ? (var.postgresql_enabled ? azurerm_subnet.postgresql[0].id : null) : var.existing_postgresql_subnet_id
+  postgresql_subnet_id = var.create_vnet ? one(azurerm_subnet.postgresql[*].id) : var.existing_postgresql_subnet_id
+
+  # Private endpoints go to a dedicated subnet when one is supplied, else the AKS subnet.
+  private_endpoint_subnet_id = coalesce(var.existing_private_endpoint_subnet_id, local.aks_subnet_id)
 }
 
 # AKS Subnet
@@ -75,7 +78,7 @@ resource "azurerm_subnet" "appgw" {
 
 # PostgreSQL Subnet (delegated to PostgreSQL service)
 resource "azurerm_subnet" "postgresql" {
-  count                = (var.create_vnet && var.postgresql_enabled) ? 1 : 0
+  count                = (var.create_vnet && var.postgresql_enabled && var.postgresql_network_mode == "vnet_integration") ? 1 : 0
   name                 = "snet-postgresql-${var.environment}"
   resource_group_name  = local.vnet_rg
   virtual_network_name = local.vnet_name
@@ -102,8 +105,8 @@ resource "azurerm_subnet" "postgresql" {
 resource "terraform_data" "byo_subnet_guard" {
   lifecycle {
     precondition {
-      condition     = var.create_vnet || (var.existing_aks_subnet_id != null && var.existing_appgw_subnet_id != null && (!var.postgresql_enabled || var.existing_postgresql_subnet_id != null))
-      error_message = "create_vnet=false requires existing_aks_subnet_id, existing_appgw_subnet_id, and (when postgresql_enabled=true) existing_postgresql_subnet_id to be set to full ARM subnet resource IDs."
+      condition     = var.create_vnet || (var.existing_aks_subnet_id != null && var.existing_appgw_subnet_id != null && (!var.postgresql_enabled || var.postgresql_network_mode == "private_endpoint" || var.existing_postgresql_subnet_id != null))
+      error_message = "create_vnet=false requires existing_aks_subnet_id, existing_appgw_subnet_id, and (when postgresql_enabled=true with VNet integration) existing_postgresql_subnet_id to be set to full ARM subnet resource IDs."
     }
   }
 }

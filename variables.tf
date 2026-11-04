@@ -58,6 +58,17 @@ variable "key_vault_allowed_ip_ranges" {
   }
 }
 
+variable "key_vault_soft_delete_retention_days" {
+  description = "Soft-delete retention in days for the CMK Key Vault (enable_cmk = true). Default 7. Azure sets it only when the vault is created; changing it later fails, so set the final value before the first apply."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.key_vault_soft_delete_retention_days >= 7 && var.key_vault_soft_delete_retention_days <= 90
+    error_message = "key_vault_soft_delete_retention_days must be between 7 and 90."
+  }
+}
+
 variable "enable_cmk" {
   description = "Use customer-managed keys (CMK) for encryption. When false, Azure uses platform-managed keys (PMK) instead — data is still AES-256 encrypted at rest, Azure just manages the key. Set to false for subscription transfers to eliminate Key Vault and encryption identity dependencies."
   type        = bool
@@ -131,13 +142,52 @@ variable "existing_appgw_subnet_id" {
 }
 
 variable "existing_postgresql_subnet_id" {
-  description = "Full ARM resource ID of a pre-created, delegated PostgreSQL subnet. Only used if create_vnet=false and postgresql_enabled=true. Must be delegated to Microsoft.DBforPostgreSQL/flexibleServers and dedicated."
+  description = "Full ARM resource ID of a pre-created, delegated PostgreSQL subnet. Only used if create_vnet=false, postgresql_enabled=true and postgresql_network_mode=vnet_integration. Must be delegated to Microsoft.DBforPostgreSQL/flexibleServers and dedicated."
   type        = string
   default     = null
 
   validation {
     condition     = var.existing_postgresql_subnet_id == null || can(regex("^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/virtualNetworks/[^/]+/subnets/[^/]+$", var.existing_postgresql_subnet_id))
     error_message = "existing_postgresql_subnet_id must be a full ARM subnet resource ID (/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/virtualNetworks/.../subnets/...)."
+  }
+}
+
+variable "existing_private_endpoint_subnet_id" {
+  description = "Full ARM resource ID of a dedicated subnet for the module's private endpoints (ACR, Foundry, Key Vault, storage, and PostgreSQL in private_endpoint mode, one per server). Default null: they use the AKS subnet. Changing it on an existing deployment recreates the endpoints, which changes their IPs."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.existing_private_endpoint_subnet_id == null || can(regex("^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/virtualNetworks/[^/]+/subnets/[^/]+$", var.existing_private_endpoint_subnet_id))
+    error_message = "existing_private_endpoint_subnet_id must be a full ARM subnet resource ID (/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/virtualNetworks/.../subnets/...)."
+  }
+}
+
+variable "private_dns_zones_managed_externally" {
+  description = "When true, the module creates no private DNS zones or VNet links (blob, Key Vault, ACR, PostgreSQL, Foundry): they live centrally, e.g. in a hub subscription. Each private endpoint registers into the matching existing_private_dns_zone_ids entry, or gets no DNS zone group when that entry is null (central policy registers the record). Default false. Set it before the first apply: turning it on in an existing deployment destroys the module's zones, VNet links and A records (link the hub zones to the VNet first), and with postgresql_network_mode = \"vnet_integration\" the changed private_dns_zone_id can replace every PostgreSQL server. Run a plan first."
+  type        = bool
+  default     = false
+}
+
+variable "existing_private_dns_zone_ids" {
+  description = "ARM resource IDs of centrally managed private DNS zones, used when private_dns_zones_managed_externally = true. blob = privatelink.blob.core.windows.net, key_vault = privatelink.vaultcore.azure.net, acr = privatelink.azurecr.io, foundry = privatelink.services.ai.azure.com, postgresql = privatelink.postgres.database.azure.com (private_endpoint mode) or a *.postgres.database.azure.com zone (vnet_integration mode, required there). The Terraform identity needs Private DNS Zone Contributor on each zone it registers into."
+  type = object({
+    blob       = optional(string)
+    key_vault  = optional(string)
+    acr        = optional(string)
+    foundry    = optional(string)
+    postgresql = optional(string)
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition     = alltrue([for id in values(var.existing_private_dns_zone_ids) : id == null || can(regex("^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/privateDnsZones/[^/]+$", id))])
+    error_message = "existing_private_dns_zone_ids entries must be full ARM private DNS zone IDs (/subscriptions/.../resourceGroups/.../providers/Microsoft.Network/privateDnsZones/...)."
+  }
+  validation {
+    condition     = !var.private_dns_zones_managed_externally || !var.postgresql_enabled || var.postgresql_network_mode == "private_endpoint" || var.existing_private_dns_zone_ids.postgresql != null
+    error_message = "With private_dns_zones_managed_externally = true and postgresql_network_mode = \"vnet_integration\", existing_private_dns_zone_ids.postgresql is required: a VNet-integrated server needs its zone at creation."
   }
 }
 
@@ -237,9 +287,25 @@ variable "network_data_plane" {
 # ===== AKS Configuration =====
 
 variable "kubernetes_version" {
-  description = "Kubernetes version"
+  description = "Kubernetes version. Give a minor version (for example 1.35) while aks_automatic_upgrade_channel is set; a full patch version is allowed only when it is null."
   type        = string
   default     = "1.35"
+
+  validation {
+    condition     = var.aks_automatic_upgrade_channel == null || can(regex("^\\d+\\.\\d+$", var.kubernetes_version))
+    error_message = "kubernetes_version must be a minor version such as 1.35 while aks_automatic_upgrade_channel is set. Drop the patch component, or set aks_automatic_upgrade_channel = null to pin a patch version."
+  }
+}
+
+variable "aks_automatic_upgrade_channel" {
+  description = "AKS automatic upgrade channel: \"patch\" (default) applies patch releases within kubernetes_version's minor version, weekly on Sunday 02:00-06:00 UTC. null turns automatic upgrades off. \"stable\" and \"rapid\" change the minor version, so Terraform would plan a downgrade; they are not accepted."
+  type        = string
+  default     = "patch"
+
+  validation {
+    condition     = var.aks_automatic_upgrade_channel == null || var.aks_automatic_upgrade_channel == "patch"
+    error_message = "aks_automatic_upgrade_channel must be \"patch\" or null."
+  }
 }
 
 # "system" is the cluster's inline default_node_pool, which azurerm requires on
@@ -335,9 +401,9 @@ variable "node_groups" {
 }
 
 variable "availability_zones" {
-  description = "Availability zones for AKS nodes"
+  description = "Availability zones for AKS nodes and the App Gateway. Azure can restrict a VM size in a zone per subscription (common on new subscriptions); check with az vm list-skus. Set before the first apply: changing it later replaces the App Gateway (only its public IP ignores zone changes)."
   type        = list(string)
-  default     = ["1", "3"] # eastus2 only supports zones 1 and 3
+  default     = ["1", "3"]
 }
 
 variable "aks_outbound_type" {
@@ -352,6 +418,29 @@ variable "aks_outbound_type" {
     condition     = var.aks_outbound_type == "loadBalancer" || !var.create_vnet
     error_message = "aks_outbound_type = \"userDefinedRouting\" requires create_vnet = false: the module-created AKS subnet has no route table."
   }
+}
+
+variable "log_analytics_workspace_id" {
+  description = "Full ARM resource ID of a Log Analytics workspace. When set, AKS sends Container Insights data to it (managed identity auth). Default null: off. Diagnostic settings are left to the caller; see the resource ID outputs."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.log_analytics_workspace_id == null || can(regex("(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.OperationalInsights/workspaces/[^/]+$", var.log_analytics_workspace_id))
+    error_message = "log_analytics_workspace_id must be a full ARM resource ID (/subscriptions/.../resourceGroups/.../providers/Microsoft.OperationalInsights/workspaces/...), not the workspace GUID."
+  }
+}
+
+variable "log_analytics_workspace_location" {
+  description = "Region of the log_analytics_workspace_id workspace. The Container Insights data collection rule must be in the workspace's region. Defaults to the resource group location. Set it when the workspace is in another region (e.g. a central hub workspace)."
+  type        = string
+  default     = null
+}
+
+variable "azure_policy_enabled" {
+  description = "Install the Azure Policy add-on (Gatekeeper) so Azure Policy assignments apply inside the cluster. Default false."
+  type        = bool
+  default     = false
 }
 
 variable "api_server_authorized_cidrs" {
@@ -502,6 +591,45 @@ variable "appgw_waf_firewall_mode" {
   }
 }
 
+variable "appgw_ssl_policy" {
+  description = "App Gateway TLS policy. Default null: the Azure default policy. Use policy_type = \"Predefined\" with a policy_name (e.g. AppGwSslPolicy20220101S, TLS 1.2 minimum), or \"CustomV2\" with min_protocol_version TLSv1_2 (plus cipher_suites) or TLSv1_3 (no cipher_suites: TLS 1.3 suites are fixed)."
+  type = object({
+    policy_type          = string
+    policy_name          = optional(string)
+    min_protocol_version = optional(string)
+    cipher_suites        = optional(list(string))
+  })
+  default = null
+
+  validation {
+    condition     = var.appgw_ssl_policy == null || contains(["Predefined", "CustomV2"], try(var.appgw_ssl_policy.policy_type, ""))
+    error_message = "appgw_ssl_policy.policy_type must be Predefined or CustomV2."
+  }
+
+  # try(): attribute access on a null policy errors, and null is valid.
+  validation {
+    condition = try(
+      var.appgw_ssl_policy.policy_type == "Predefined"
+      ? var.appgw_ssl_policy.policy_name != null && var.appgw_ssl_policy.min_protocol_version == null && var.appgw_ssl_policy.cipher_suites == null
+      : var.appgw_ssl_policy.policy_name == null && var.appgw_ssl_policy.min_protocol_version != null,
+      true
+    )
+    error_message = "appgw_ssl_policy: Predefined needs policy_name only; CustomV2 needs min_protocol_version (optionally cipher_suites) and no policy_name."
+  }
+
+  # Azure fixes the TLS 1.3 cipher suites and rejects cipher_suites at apply time.
+  validation {
+    condition = try(
+      var.appgw_ssl_policy.policy_type != "CustomV2" || (
+        contains(["TLSv1_2", "TLSv1_3"], var.appgw_ssl_policy.min_protocol_version) &&
+        !(var.appgw_ssl_policy.min_protocol_version == "TLSv1_3" && var.appgw_ssl_policy.cipher_suites != null)
+      ),
+      true
+    )
+    error_message = "appgw_ssl_policy: CustomV2 min_protocol_version must be TLSv1_2 or TLSv1_3, and cipher_suites must be omitted with TLSv1_3."
+  }
+}
+
 variable "appgw_frontend_type" {
   description = <<-EOT
     App Gateway frontend exposure:
@@ -553,6 +681,17 @@ variable "postgresql_enabled" {
   description = "Deploy PostgreSQL Flexible Server"
   type        = bool
   default     = true
+}
+
+variable "postgresql_network_mode" {
+  description = "How PostgreSQL is reached privately. \"vnet_integration\" (default): servers sit in a delegated subnet. \"private_endpoint\": no delegated subnet; each server gets a private endpoint in the private endpoint subnet and uses privatelink.postgres.database.azure.com. Fixed at creation: changing it recreates every server and loses its data."
+  type        = string
+  default     = "vnet_integration"
+
+  validation {
+    condition     = contains(["vnet_integration", "private_endpoint"], var.postgresql_network_mode)
+    error_message = "postgresql_network_mode must be vnet_integration or private_endpoint."
+  }
 }
 
 variable "postgresql_sku_name" {
@@ -726,6 +865,28 @@ variable "storage_public_network_access_enabled" {
   validation {
     condition     = var.storage_public_network_access_enabled || !var.storage_general_enabled || !contains(["public", "both"], var.appgw_frontend_type)
     error_message = "appgw_frontend_type = \"public\"/\"both\" serves internet users, whose browsers upload to general storage via presigned URLs. Set storage_public_network_access_enabled = true, or use a private frontend."
+  }
+}
+
+variable "storage_replication_type" {
+  description = "Replication for the logging and general storage accounts: LRS, ZRS, GRS, RAGRS, GZRS or RAGZRS. Default LRS. Moving to or from a zone-redundant type (ZRS, GZRS, RAGZRS) recreates the account, so choose it before the first apply. Azure has no archive tier for zone-redundant types, so with ZRS, GZRS or RAGZRS the logging lifecycle skips transition_to_archive_days."
+  type        = string
+  default     = "LRS"
+
+  validation {
+    condition     = contains(["LRS", "ZRS", "GRS", "RAGRS", "GZRS", "RAGZRS"], var.storage_replication_type)
+    error_message = "storage_replication_type must be one of: LRS, ZRS, GRS, RAGRS, GZRS, RAGZRS."
+  }
+}
+
+variable "storage_delete_retention_days" {
+  description = "Soft-delete retention in days for blobs and containers in the logging and general storage accounts. Default 7."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.storage_delete_retention_days >= 1 && var.storage_delete_retention_days <= 365
+    error_message = "storage_delete_retention_days must be between 1 and 365."
   }
 }
 
@@ -1003,6 +1164,47 @@ variable "private_cluster_enabled" {
   description = "Private cluster API (no public endpoint). Default true. Terraform must run from a host that can reach and resolve the private API: a runner inside the VNet or a peered network (e.g. an HCP Terraform agent on a VM). The in-cluster TFC agent cannot bootstrap a private cluster. Set false (with api_server_authorized_cidrs) to opt into a public API. Changing this forces a new cluster."
   type        = bool
   default     = true
+}
+
+variable "aks_private_dns_zone_id" {
+  description = "Private DNS zone for the private AKS API. null (default): AKS creates and manages a zone (\"System\"). \"None\": no private zone; the API name resolves through public DNS to the private IP. A zone ID: a customer-owned privatelink.<region>.azmk8s.io zone, which requires aks_identity_id with Private DNS Zone Contributor on the zone. Changing it forces a new cluster."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.aks_private_dns_zone_id == null || contains(["System", "None"], coalesce(var.aks_private_dns_zone_id, "x")) || can(regex("^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.Network/privateDnsZones/[^/]+$", coalesce(var.aks_private_dns_zone_id, "x")))
+    error_message = "aks_private_dns_zone_id must be null, \"System\", \"None\", or a full ARM private DNS zone ID."
+  }
+  validation {
+    condition     = var.aks_private_dns_zone_id == null || var.private_cluster_enabled
+    error_message = "aks_private_dns_zone_id applies only to a private cluster (private_cluster_enabled = true)."
+  }
+  validation {
+    condition     = var.aks_private_dns_zone_id == null || contains(["System", "None"], coalesce(var.aks_private_dns_zone_id, "x")) || var.aks_identity_id != null
+    error_message = "A customer-owned aks_private_dns_zone_id requires aks_identity_id: a user-assigned identity with Private DNS Zone Contributor on the zone."
+  }
+}
+
+variable "aks_identity_id" {
+  description = "ARM resource ID of a user-assigned identity for the AKS control plane. Default null: system-assigned. Required with a customer-owned aks_private_dns_zone_id. Grant it Private DNS Zone Contributor on that zone, and Network Contributor on the VNet (AKS creates the zone's VNet link; with a System or None zone the AKS subnet is enough) and on its route table, before the first apply. With create_vnet = true the module grants the network role. The Terraform identity needs Managed Identity Operator on it. In another subscription than the provider, also set aks_identity_principal_id. Changing it on an existing cluster updates the control-plane identity in place."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.aks_identity_id == null || can(regex("^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft\\.ManagedIdentity/userAssignedIdentities/[^/]+$", coalesce(var.aks_identity_id, "x")))
+    error_message = "aks_identity_id must be a full ARM user-assigned identity ID (/subscriptions/.../resourceGroups/.../providers/Microsoft.ManagedIdentity/userAssignedIdentities/...)."
+  }
+}
+
+variable "aks_identity_principal_id" {
+  description = "Principal (object) ID of the aks_identity_id identity. Default null: the module looks it up, which only works when the identity is in the provider's subscription. Set it for an identity in another subscription, such as a hub."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.aks_identity_principal_id == null || var.aks_identity_id != null
+    error_message = "aks_identity_principal_id requires aks_identity_id."
+  }
 }
 
 # ===== Azure AI Foundry =====

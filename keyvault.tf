@@ -12,7 +12,7 @@ resource "azurerm_key_vault" "main" {
   rbac_authorization_enabled = true
 
   # Soft delete and purge protection
-  soft_delete_retention_days = 7
+  soft_delete_retention_days = var.key_vault_soft_delete_retention_days
   purge_protection_enabled   = true
 
   # Private by default: deny public traffic. AzureServices lets the CMK
@@ -38,8 +38,13 @@ resource "azurerm_role_assignment" "kv_admin_current_user" {
 
 # ===== Private endpoint =====
 
+locals {
+  key_vault_dns_zone_id = var.private_dns_zones_managed_externally ? var.existing_private_dns_zone_ids.key_vault : try(azurerm_private_dns_zone.key_vault[0].id, null)
+  key_vault_policy_dns  = var.private_dns_zones_managed_externally && var.existing_private_dns_zone_ids.key_vault == null
+}
+
 resource "azurerm_private_dns_zone" "key_vault" {
-  count               = var.enable_cmk && var.key_vault_private_endpoint_enabled ? 1 : 0
+  count               = var.enable_cmk && var.key_vault_private_endpoint_enabled && !var.private_dns_zones_managed_externally ? 1 : 0
   name                = "privatelink.vaultcore.azure.net"
   resource_group_name = azurerm_resource_group.main.name
 
@@ -47,7 +52,7 @@ resource "azurerm_private_dns_zone" "key_vault" {
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "key_vault" {
-  count                 = var.enable_cmk && var.key_vault_private_endpoint_enabled ? 1 : 0
+  count                 = var.enable_cmk && var.key_vault_private_endpoint_enabled && !var.private_dns_zones_managed_externally ? 1 : 0
   name                  = "kv-${local.name_prefix}-vnet-link"
   resource_group_name   = azurerm_resource_group.main.name
   private_dns_zone_name = azurerm_private_dns_zone.key_vault[0].name
@@ -58,11 +63,11 @@ resource "azurerm_private_dns_zone_virtual_network_link" "key_vault" {
 }
 
 resource "azurerm_private_endpoint" "key_vault" {
-  count               = var.enable_cmk && var.key_vault_private_endpoint_enabled ? 1 : 0
+  count               = var.enable_cmk && var.key_vault_private_endpoint_enabled && !local.key_vault_policy_dns ? 1 : 0
   name                = "pe-${local.resource_names.key_vault}"
   resource_group_name = azurerm_resource_group.main.name
   location            = azurerm_resource_group.main.location
-  subnet_id           = local.aks_subnet_id
+  subnet_id           = local.private_endpoint_subnet_id
 
   private_service_connection {
     name                           = "psc-${local.resource_names.key_vault}"
@@ -73,7 +78,29 @@ resource "azurerm_private_endpoint" "key_vault" {
 
   private_dns_zone_group {
     name                 = "kv-dns-zone-group"
-    private_dns_zone_ids = [azurerm_private_dns_zone.key_vault[0].id]
+    private_dns_zone_ids = [local.key_vault_dns_zone_id]
+  }
+
+  tags = local.common_tags
+}
+
+# See azurerm_private_endpoint.acr_policy_dns: policy-managed DNS zone group.
+resource "azurerm_private_endpoint" "key_vault_policy_dns" {
+  count               = var.enable_cmk && var.key_vault_private_endpoint_enabled && local.key_vault_policy_dns ? 1 : 0
+  name                = "pe-${local.resource_names.key_vault}"
+  resource_group_name = azurerm_resource_group.main.name
+  location            = azurerm_resource_group.main.location
+  subnet_id           = local.private_endpoint_subnet_id
+
+  private_service_connection {
+    name                           = "psc-${local.resource_names.key_vault}"
+    private_connection_resource_id = azurerm_key_vault.main[0].id
+    is_manual_connection           = false
+    subresource_names              = ["vault"]
+  }
+
+  lifecycle {
+    ignore_changes = [private_dns_zone_group]
   }
 
   tags = local.common_tags
@@ -88,6 +115,7 @@ resource "time_sleep" "key_vault_ready" {
   depends_on = [
     azurerm_role_assignment.kv_admin_current_user,
     azurerm_private_endpoint.key_vault,
+    azurerm_private_endpoint.key_vault_policy_dns,
     azurerm_private_dns_zone_virtual_network_link.key_vault,
   ]
 }

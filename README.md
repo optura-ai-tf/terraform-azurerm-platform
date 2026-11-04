@@ -202,6 +202,11 @@ Default: **`true`** — a PostgreSQL Flexible Server is created.
 
 Set `postgresql_enabled = false` to skip. All `postgresql_*` inputs are ignored when disabled.
 
+**Network mode (`postgresql_network_mode`).** Fixed when a server is created; changing it recreates every server and loses its data.
+
+- `vnet_integration` (default): each server sits in the delegated PostgreSQL subnet and uses a `<environment>.postgres.database.azure.com` zone.
+- `private_endpoint`: no delegated subnet. Each server gets a private endpoint in the private endpoint subnet and uses `privatelink.postgres.database.azure.com`, the same pattern as storage and Key Vault. `existing_postgresql_subnet_id` is not needed. Connection strings are unchanged: the server FQDN resolves through the privatelink zone.
+
 When enabled, configure:
 
 | Input | Default | Description |
@@ -306,7 +311,7 @@ Set `create_vnet = false` to bring your own (BYO) network: the module creates **
 | `existing_vnet_rg` | yes | Resource group of the existing VNet |
 | `existing_aks_subnet_id` | yes | Full ARM resource ID of the existing AKS node subnet |
 | `existing_appgw_subnet_id` | yes | Full ARM resource ID of the existing Application Gateway subnet |
-| `existing_postgresql_subnet_id` | yes (when `postgresql_enabled = true`) | Full ARM resource ID of the existing PostgreSQL delegated subnet |
+| `existing_postgresql_subnet_id` | yes (when `postgresql_enabled = true` with `vnet_integration`) | Full ARM resource ID of the existing PostgreSQL delegated subnet |
 
 The `aks_subnet_address_prefix` / `appgw_subnet_address_prefix` / `postgresql_subnet_address_prefix` inputs apply only when `create_vnet = true`. In BYO mode they are ignored — subnets are referenced by ID, so their CIDRs are whatever you provisioned out of band.
 
@@ -314,8 +319,9 @@ The `aks_subnet_address_prefix` / `appgw_subnet_address_prefix` / `postgresql_su
 
 BYO subnets must satisfy the same shape the module would otherwise create:
 
-- **PostgreSQL subnet** — **delegated** to `Microsoft.DBforPostgreSQL/flexibleServers` and **dedicated** (no other resources). A missing or shared delegation fails the apply.
-- **AKS subnet** — with [overlay](#pod-networking-pod_cidr) (the default) it holds only nodes and private endpoints (a /26 fits ~20 nodes). With `pod_cidr = null`, each pod gets a VNet IP (31 per node at the default 30 pods), so plan a large range (**~/20**). Recommended service endpoints: `Microsoft.ContainerRegistry` and `Microsoft.Storage`.
+- **PostgreSQL subnet** (only with `postgresql_network_mode = "vnet_integration"`, the default) — **delegated** to `Microsoft.DBforPostgreSQL/flexibleServers` and **dedicated** (no other resources). A missing or shared delegation fails the apply. In `private_endpoint` mode no PostgreSQL subnet is needed: the endpoints go in the private endpoint subnet.
+- **AKS subnet** — with [overlay](#pod-networking-pod_cidr) (the default) it holds only nodes and, unless you set `existing_private_endpoint_subnet_id`, the private endpoints (a /26 fits ~20 nodes). With `pod_cidr = null`, each pod gets a VNet IP (31 per node at the default 30 pods), so plan a large range (**~/20**). Service endpoints are not needed: ACR, storage, Key Vault, and Foundry are reached through private endpoints.
+- **Private endpoint subnet** (optional, `existing_private_endpoint_subnet_id`) — holds the private endpoints for ACR, Foundry, Key Vault, both storage accounts, and, with `postgresql_network_mode = "private_endpoint"`, one per PostgreSQL server. That is 6 IPs plus one per entry in `databases` (ACR takes two, for the registry and its data endpoint). A /28 has 11 usable IPs, so it fits at most 5 servers; size up for more. Without it they go in the AKS subnet. Changing it on an existing deployment recreates the endpoints with new IPs.
 - **Application Gateway subnet** — **dedicated** to the Application Gateway (App Gateway v2 requires its own subnet). With overlay (the default) it must also be **/24 or smaller** and **delegated** to `Microsoft.Network/applicationGateways`. The module cannot check a BYO subnet; a missing delegation shows up as AGIC failing to route to pods.
 
 #### Required out-of-band RBAC (`create_vnet = false`)
@@ -326,6 +332,30 @@ When the module owns the VNet (`create_vnet = true`) it auto-creates the network
 - The **AGIC ingress identity** needs **Network Contributor** on the **Application Gateway subnet** (to program the gateway).
 
 Without these the cluster and ingress controller cannot operate on the BYO subnets.
+
+#### Central private DNS zones (`private_dns_zones_managed_externally`)
+
+By default the module creates each privatelink zone it needs in its own resource group and links it to the VNet. In a hub-and-spoke landing zone the zones usually live in a central subscription, and Azure rejects a second zone of the same name on one VNet. Set:
+
+```hcl
+private_dns_zones_managed_externally = true
+existing_private_dns_zone_ids = {
+  blob       = "/subscriptions/<hub>/resourceGroups/<rg>/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net"
+  key_vault  = ".../privateDnsZones/privatelink.vaultcore.azure.net"
+  acr        = ".../privateDnsZones/privatelink.azurecr.io"
+  foundry    = ".../privateDnsZones/privatelink.services.ai.azure.com"
+  postgresql = ".../privateDnsZones/privatelink.postgres.database.azure.com"
+}
+```
+
+- The module then creates **no** zones or VNet links.
+- **Set it before the first apply.** Turning it on in an existing deployment destroys the module's zones, VNet links and A records; until the hub zones are linked to the VNet, ACR, Key Vault, blob and Foundry calls fail. With `postgresql_network_mode = "vnet_integration"` the server's `private_dns_zone_id` changes, which can replace every PostgreSQL server and lose its data. Run a plan against the existing state first.
+- A private endpoint whose entry is set registers its A record in that zone; the Terraform identity needs **Private DNS Zone Contributor** on it.
+- A private endpoint whose entry is `null` gets no DNS zone group. Use this when central policy (deploy-if-not-exists) registers the records. Without such a policy the name resolves to the public endpoint, which is closed, so the service is unreachable. The module ignores the zone group the policy adds, so later plans don't remove it. Changing an entry between `null` and a zone ID recreates that private endpoint, and its IP changes. Terraform can create the new endpoint before it deletes the old one of the same name, so that apply can fail with "already exists"; apply again. Policy registers the record asynchronously, often minutes after the endpoint exists. Until then a first apply can fail at Key Vault key creation or the PostgreSQL bootstrap job. Apply again once the record exists. For Key Vault, adding the runner's IP to `key_vault_allowed_ip_ranges` also avoids it.
+- With `postgresql_network_mode = "vnet_integration"` the `postgresql` entry is required: a VNet-integrated server needs its zone at creation. If the zone is in another subscription than the server, register the `Microsoft.DBforPostgreSQL` resource provider in the zone's subscription too. Without it, server creation fails.
+- The private AKS API zone is separate: see [Private Cluster](#feature-private-cluster-private_cluster_enabled).
+
+The hub zones must be resolvable from the VNet: link them to it, or point its DNS servers at a resolver that can see them.
 
 #### Pod networking (`pod_cidr`)
 
@@ -417,9 +447,11 @@ In-cluster services reach this account through [Workload Identity](#workload-ide
 
 > Permissions are scoped to the whole account — any federated SA can read/write every container. Cross-container isolation is enforced at the application layer.
 
-> **Private by default.** Both accounts are reachable only through their private endpoints. Browser uploads through presigned URLs go to the private endpoint too: users' networks need a route to the AKS subnet and DNS that resolves `privatelink.blob.core.windows.net`. Terraform manages containers and lifecycle policies through the management plane, so applies are unaffected.
+> **Private by default.** Both accounts are reachable only through their private endpoints. Browser uploads through presigned URLs go to the private endpoint too: users' networks need a route to the private endpoint subnet (the AKS subnet by default) and DNS that resolves `privatelink.blob.core.windows.net`. Terraform manages containers and lifecycle policies through the management plane, so applies are unaffected.
 >
 > With a **public** App Gateway frontend, users upload from the internet: set `storage_public_network_access_enabled = true`. Auth (Workload Identity or account keys) is then the gate.
+
+Both accounts use `storage_replication_type` (default `LRS`) and keep deleted blobs and containers for `storage_delete_retention_days` (default 7). Choose the replication type before the first apply: a move to or from a zone-redundant type (`ZRS`, `GZRS`, `RAGZRS`) recreates the account. Azure has no archive tier for zone-redundant types, so with those the logging lifecycle skips `transition_to_archive_days`.
 
 ## Workload Identity
 
@@ -492,6 +524,8 @@ This keeps the platform identities and adds one UAMI (`id-<project>-<env>-report
 
 Default: **`true`** — a Premium Key Vault holds the keys for AKS disks, PostgreSQL, storage, and ACR. Set `false` for platform-managed keys (still AES-256 at rest) and no Key Vault.
 
+The vault keeps deleted keys for `key_vault_soft_delete_retention_days` (default 7, up to 90). Azure sets this only when the vault is created, so choose the value before the first apply.
+
 The vault firewall is **deny-all**. Azure trusted services (the CMK consumers) bypass it; Terraform, which writes and reads the keys over the data plane, reaches it through the private endpoint or an allowed range:
 
 | Input | Default | Description |
@@ -534,6 +568,49 @@ appgw_waf_enabled = true
 
 When enabled, also configure `appgw_waf_firewall_mode` (default `Prevention`; `Detection` logs only, `Prevention` blocks).
 
+### Feature: App Gateway TLS policy (`appgw_ssl_policy`)
+
+Default: **`null`** (the Azure default policy). Pin a predefined policy, or set a TLS 1.3 minimum with `CustomV2`:
+
+```hcl
+appgw_ssl_policy = {
+  policy_type = "Predefined"
+  policy_name = "AppGwSslPolicy20220101S" # TLS 1.2 minimum, strong ciphers
+}
+
+appgw_ssl_policy = {
+  policy_type          = "CustomV2"
+  min_protocol_version = "TLSv1_3" # TLS 1.3 cipher suites are fixed; omit cipher_suites
+}
+```
+
+### Feature: Monitoring and policy (`log_analytics_workspace_id`, `azure_policy_enabled`)
+
+- `log_analytics_workspace_id` (default `null`): turns on Container Insights, sending node, pod, and container data to the workspace. The module creates the data collection rule and its association.
+- `log_analytics_workspace_location` (default: the resource group location): the workspace's region. The data collection rule must be in that region, so set it when the workspace is in another region (e.g. a central hub workspace).
+- `azure_policy_enabled` (default `false`): installs the Azure Policy add-on (Gatekeeper) so Azure Policy assignments apply inside the cluster.
+
+The module creates no diagnostic settings: the destination (Log Analytics, Event Hub, storage) and the log categories differ per deployment. Attach them in the root module with the resource ID outputs (`cluster_id`, `application_gateway_id`, `database_server_ids`, `logging_storage_id`, `general_storage_id`, `foundry_account_id`, `key_vault_id`). Storage logs attach to the blob service:
+
+```hcl
+resource "azurerm_monitor_diagnostic_setting" "postgresql" {
+  for_each                   = module.platform.database_server_ids
+  name                       = "to-log-analytics"
+  target_resource_id         = each.value
+  log_analytics_workspace_id = var.log_analytics_workspace_id
+
+  enabled_log { category_group = "allLogs" }
+}
+
+resource "azurerm_monitor_diagnostic_setting" "general_storage_blob" {
+  name                       = "to-log-analytics"
+  target_resource_id         = "${module.platform.general_storage_id}/blobServices/default"
+  log_analytics_workspace_id = var.log_analytics_workspace_id
+
+  enabled_log { category_group = "audit" }
+}
+```
+
 ### Feature: Cluster Access via Teleport (`access_mode`)
 
 Default: **`teleport`** — the module deploys a Teleport agent. (`vpn` assumes an existing VPN or public endpoint.) When `access_mode = "teleport"`, configure:
@@ -559,6 +636,24 @@ Terraform must run from a host that can reach **and resolve** the private API (t
 - **Opt into a public API:** `private_cluster_enabled = false` with `api_server_authorized_cidrs` set to your runner's egress IPs.
 
 > `private_cluster_enabled` **forces a new cluster** when changed. Choose it before the first apply; switching later destroys and recreates AKS.
+
+#### API DNS zone (`aks_private_dns_zone_id`, `aks_identity_id`)
+
+- `null` (default): AKS creates and manages `privatelink.<region>.azmk8s.io` in the node resource group.
+- `"None"`: no private zone. The API name resolves through public DNS to the private IP.
+- A zone ID: a customer-owned zone, for example in a hub subscription. AKS then needs a **user-assigned** control-plane identity (`aks_identity_id`), prepared before the first apply:
+  - **Private DNS Zone Contributor** on the zone.
+  - **Network Contributor** on the VNet (AKS creates the zone's VNet link) and on the route table. With `create_vnet = true` the module grants the VNet role.
+  - The Terraform identity needs **Managed Identity Operator** on it.
+  - If the identity is in another subscription than the provider, also set `aks_identity_principal_id`. The module can only look up identities in the provider's subscription.
+  - If the zone is in another subscription than the cluster, register the `Microsoft.ContainerService` resource provider in the zone's subscription too. Without it, cluster creation fails.
+
+```hcl
+aks_private_dns_zone_id = "/subscriptions/<hub>/resourceGroups/<rg>/providers/Microsoft.Network/privateDnsZones/privatelink.eastus2.azmk8s.io"
+aks_identity_id         = "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/id-aks-controlplane"
+```
+
+Changing the zone forces a new cluster.
 
 #### In-cluster TFC agent (`tfc_agent_enabled`)
 
@@ -592,7 +687,7 @@ When `tfc_agent_enabled = true`, configure:
 
 Default: **`false`** — no Foundry resources.
 
-Set `foundry_enabled = true` to provision a Foundry (AI Services) account, a private endpoint into the AKS subnet, and a UAMI federated to the in-cluster `intent` ServiceAccount. Model deployments (Claude, GPT, …) are created manually via the Foundry portal. When enabled, configure:
+Set `foundry_enabled = true` to provision a Foundry (AI Services) account, a private endpoint (in the private endpoint subnet, or the AKS subnet by default), and a UAMI federated to the in-cluster `intent` ServiceAccount. Model deployments (Claude, GPT, …) are created manually via the Foundry portal. When enabled, configure:
 
 | Input | Default | Description |
 |---|---|---|
@@ -609,6 +704,8 @@ Set `foundry_enabled = true` to provision a Foundry (AI Services) account, a pri
 The Foundry UAMI's `client_id` is exposed through the `workload_identities` output (the `intent` key). Annotate the `intent` ServiceAccount (in the `core` namespace by default) with `azure.workload.identity/client-id = <that client_id>`.
 
 #### Foundry private DNS in a centrally-managed VNet
+
+`private_dns_zones_managed_externally = true` (see [Central private DNS zones](#central-private-dns-zones-private_dns_zones_managed_externally)) has the same effect for every zone, with the Foundry ID in `existing_private_dns_zone_ids.foundry`.
 
 In the default deployment (`create_vnet = true`, or `create_vnet = false` with no central privatelink zone) leave both `foundry_private_dns_managed_externally` and `foundry_existing_private_dns_zone_id` unset — the module creates the `privatelink.services.ai.azure.com` zone, links it to the VNet, and registers the PE's A record.
 
@@ -769,6 +866,8 @@ No modules.
 | [azurerm_key_vault_key.storage_logging](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/key_vault_key) | resource |
 | [azurerm_kubernetes_cluster.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/kubernetes_cluster) | resource |
 | [azurerm_kubernetes_cluster_node_pool.user](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/kubernetes_cluster_node_pool) | resource |
+| [azurerm_monitor_data_collection_rule.container_insights](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/monitor_data_collection_rule) | resource |
+| [azurerm_monitor_data_collection_rule_association.container_insights](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/monitor_data_collection_rule_association) | resource |
 | [azurerm_postgresql_flexible_server.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/postgresql_flexible_server) | resource |
 | [azurerm_postgresql_flexible_server_active_directory_administrator.teleport](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/postgresql_flexible_server_active_directory_administrator) | resource |
 | [azurerm_postgresql_flexible_server_configuration.extensions](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/postgresql_flexible_server_configuration) | resource |
@@ -784,10 +883,17 @@ No modules.
 | [azurerm_private_dns_zone_virtual_network_link.key_vault](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_dns_zone_virtual_network_link) | resource |
 | [azurerm_private_dns_zone_virtual_network_link.postgresql](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_dns_zone_virtual_network_link) | resource |
 | [azurerm_private_endpoint.acr](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.acr_policy_dns](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
 | [azurerm_private_endpoint.foundry](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.foundry_policy_dns](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
 | [azurerm_private_endpoint.key_vault](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.key_vault_policy_dns](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.postgresql](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.postgresql_policy_dns](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
 | [azurerm_private_endpoint.storage_blob](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.storage_blob_policy_dns](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
 | [azurerm_private_endpoint.storage_logging_blob](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
+| [azurerm_private_endpoint.storage_logging_blob_policy_dns](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/private_endpoint) | resource |
 | [azurerm_public_ip.appgw](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/public_ip) | resource |
 | [azurerm_resource_group.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/resource_group) | resource |
 | [azurerm_role_assignment.agic_appgw](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
@@ -797,6 +903,7 @@ No modules.
 | [azurerm_role_assignment.aks_acr_pull](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
 | [azurerm_role_assignment.aks_des_reader](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
 | [azurerm_role_assignment.aks_network](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
+| [azurerm_role_assignment.aks_network_uai](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
 | [azurerm_role_assignment.kubelet_des_reader](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
 | [azurerm_role_assignment.kv_admin_current_user](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
 | [azurerm_role_assignment.kv_crypto_acr](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/role_assignment) | resource |
@@ -849,6 +956,7 @@ No modules.
 | [time_sleep.wait_for_foundry_account](https://registry.terraform.io/providers/hashicorp/time/latest/docs/resources/sleep) | resource |
 | [azuread_group.aks_admins](https://registry.terraform.io/providers/hashicorp/azuread/latest/docs/data-sources/group) | data source |
 | [azurerm_client_config.current](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/client_config) | data source |
+| [azurerm_user_assigned_identity.aks](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/user_assigned_identity) | data source |
 | [azurerm_virtual_network.existing](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/data-sources/virtual_network) | data source |
 
 ## Inputs
@@ -863,7 +971,11 @@ No modules.
 | <a name="input_acr_zone_redundancy_enabled"></a> [acr\_zone\_redundancy\_enabled](#input\_acr\_zone\_redundancy\_enabled) | Enable zone redundancy for ACR (Premium SKU only) | `bool` | `true` | no |
 | <a name="input_aks_admin_group_id"></a> [aks\_admin\_group\_id](#input\_aks\_admin\_group\_id) | Azure AD group Object ID for AKS cluster admins (bypasses group lookup, useful when SP lacks Group.Read.All) | `string` | `null` | no |
 | <a name="input_aks_admin_group_name"></a> [aks\_admin\_group\_name](#input\_aks\_admin\_group\_name) | Azure AD group name for AKS cluster admins (ignored if aks\_admin\_group\_id is set) | `string` | `"AKS Terraform Admins"` | no |
+| <a name="input_aks_automatic_upgrade_channel"></a> [aks\_automatic\_upgrade\_channel](#input\_aks\_automatic\_upgrade\_channel) | AKS automatic upgrade channel: "patch" (default) applies patch releases within kubernetes\_version's minor version, weekly on Sunday 02:00-06:00 UTC. null turns automatic upgrades off. "stable" and "rapid" change the minor version, so Terraform would plan a downgrade; they are not accepted. | `string` | `"patch"` | no |
+| <a name="input_aks_identity_id"></a> [aks\_identity\_id](#input\_aks\_identity\_id) | ARM resource ID of a user-assigned identity for the AKS control plane. Default null: system-assigned. Required with a customer-owned aks\_private\_dns\_zone\_id. Grant it Private DNS Zone Contributor on that zone, and Network Contributor on the VNet (AKS creates the zone's VNet link; with a System or None zone the AKS subnet is enough) and on its route table, before the first apply. With create\_vnet = true the module grants the network role. The Terraform identity needs Managed Identity Operator on it. In another subscription than the provider, also set aks\_identity\_principal\_id. Changing it on an existing cluster updates the control-plane identity in place. | `string` | `null` | no |
+| <a name="input_aks_identity_principal_id"></a> [aks\_identity\_principal\_id](#input\_aks\_identity\_principal\_id) | Principal (object) ID of the aks\_identity\_id identity. Default null: the module looks it up, which only works when the identity is in the provider's subscription. Set it for an identity in another subscription, such as a hub. | `string` | `null` | no |
 | <a name="input_aks_outbound_type"></a> [aks\_outbound\_type](#input\_aks\_outbound\_type) | AKS egress method. "loadBalancer" (default) gives nodes a public egress IP on the cluster load balancer. "userDefinedRouting" creates no public IP: egress follows the AKS subnet's route table (e.g. 0.0.0.0/0 to a hub firewall), which must be associated with the subnet before the cluster is created, so it requires create\_vnet = false (BYO subnet). Changing it on an existing cluster may force replacement. | `string` | `"loadBalancer"` | no |
+| <a name="input_aks_private_dns_zone_id"></a> [aks\_private\_dns\_zone\_id](#input\_aks\_private\_dns\_zone\_id) | Private DNS zone for the private AKS API. null (default): AKS creates and manages a zone ("System"). "None": no private zone; the API name resolves through public DNS to the private IP. A zone ID: a customer-owned privatelink.<region>.azmk8s.io zone, which requires aks\_identity\_id with Private DNS Zone Contributor on the zone. Changing it forces a new cluster. | `string` | `null` | no |
 | <a name="input_aks_subnet_address_prefix"></a> [aks\_subnet\_address\_prefix](#input\_aks\_subnet\_address\_prefix) | Address prefix for AKS subnet | `string` | `"10.0.0.0/20"` | no |
 | <a name="input_api_server_authorized_cidrs"></a> [api\_server\_authorized\_cidrs](#input\_api\_server\_authorized\_cidrs) | Authorized CIDR blocks for API server access (only applies when private\_cluster\_enabled = false, empty = open) | `list(string)` | `[]` | no |
 | <a name="input_appgw_capacity_max"></a> [appgw\_capacity\_max](#input\_appgw\_capacity\_max) | Maximum capacity units for Application Gateway autoscaling | `number` | `10` | no |
@@ -872,10 +984,12 @@ No modules.
 | <a name="input_appgw_frontend_type"></a> [appgw\_frontend\_type](#input\_appgw\_frontend\_type) | App Gateway frontend exposure:<br/>  - "private" (default): private IP frontend only, no public IP. Ingress is<br/>    reachable only from within the VNet/peered networks (hub-and-spoke).<br/>    Requires the Microsoft.Network/EnableApplicationGatewayNetworkIsolation<br/>    feature registered on the subscription, and ingresses annotated<br/>    appgw.ingress.kubernetes.io/use-private-ip: "true".<br/>  - "public": public IP frontend only.<br/>  - "both": public and private frontends.<br/>For "private"/"both", the private IP comes from appgw\_private\_ip\_address; when<br/>create\_vnet = true it is auto-derived from appgw\_subnet\_address\_prefix if unset.<br/><br/>NOTE: changing this on an EXISTING gateway is not an in-place operation —<br/>AGIC owns the listeners (lifecycle ignore\_changes on http\_listener), so a<br/>sticky listener can still reference the removed frontend and fail the apply.<br/>Recreate the gateway (terraform apply -replace=...azurerm\_application\_gateway.main)<br/>when switching frontend type. | `string` | `"private"` | no |
 | <a name="input_appgw_private_ip_address"></a> [appgw\_private\_ip\_address](#input\_appgw\_private\_ip\_address) | Static private IP for the App Gateway private frontend. Required for "private"/"both" when create\_vnet = false (BYO subnet); when create\_vnet = true it defaults to host .10 of appgw\_subnet\_address\_prefix. Must be a free address inside the App Gateway subnet. | `string` | `null` | no |
 | <a name="input_appgw_sku"></a> [appgw\_sku](#input\_appgw\_sku) | Application Gateway SKU (Standard\_v2 or WAF\_v2) | `string` | `"Standard_v2"` | no |
+| <a name="input_appgw_ssl_policy"></a> [appgw\_ssl\_policy](#input\_appgw\_ssl\_policy) | App Gateway TLS policy. Default null: the Azure default policy. Use policy\_type = "Predefined" with a policy\_name (e.g. AppGwSslPolicy20220101S, TLS 1.2 minimum), or "CustomV2" with min\_protocol\_version TLSv1\_2 (plus cipher\_suites) or TLSv1\_3 (no cipher\_suites: TLS 1.3 suites are fixed). | <pre>object({<br/>    policy_type          = string<br/>    policy_name          = optional(string)<br/>    min_protocol_version = optional(string)<br/>    cipher_suites        = optional(list(string))<br/>  })</pre> | `null` | no |
 | <a name="input_appgw_subnet_address_prefix"></a> [appgw\_subnet\_address\_prefix](#input\_appgw\_subnet\_address\_prefix) | Address prefix for Application Gateway subnet | `string` | `"10.0.16.0/24"` | no |
 | <a name="input_appgw_waf_enabled"></a> [appgw\_waf\_enabled](#input\_appgw\_waf\_enabled) | Enable WAF (only applicable with WAF\_v2 SKU) | `bool` | `false` | no |
 | <a name="input_appgw_waf_firewall_mode"></a> [appgw\_waf\_firewall\_mode](#input\_appgw\_waf\_firewall\_mode) | WAF firewall mode (Detection or Prevention) | `string` | `"Prevention"` | no |
-| <a name="input_availability_zones"></a> [availability\_zones](#input\_availability\_zones) | Availability zones for AKS nodes | `list(string)` | <pre>[<br/>  "1",<br/>  "3"<br/>]</pre> | no |
+| <a name="input_availability_zones"></a> [availability\_zones](#input\_availability\_zones) | Availability zones for AKS nodes and the App Gateway. Azure can restrict a VM size in a zone per subscription (common on new subscriptions); check with az vm list-skus. Set before the first apply: changing it later replaces the App Gateway (only its public IP ignores zone changes). | `list(string)` | <pre>[<br/>  "1",<br/>  "3"<br/>]</pre> | no |
+| <a name="input_azure_policy_enabled"></a> [azure\_policy\_enabled](#input\_azure\_policy\_enabled) | Install the Azure Policy add-on (Gatekeeper) so Azure Policy assignments apply inside the cluster. Default false. | `bool` | `false` | no |
 | <a name="input_create_vnet"></a> [create\_vnet](#input\_create\_vnet) | Create new VNet (true) or use existing (false) | `bool` | `true` | no |
 | <a name="input_databases"></a> [databases](#input\_databases) | Map of named PostgreSQL Flexible Server instances to provision when<br/>postgresql\_enabled = true. Each map key becomes part of the server name<br/>(the special key "core" preserves the legacy unsuffixed server name for<br/>backward compatibility). Per-entry fields fall back to the top-level<br/>var.postgresql\_* defaults when omitted. | <pre>map(object({<br/>    sku_name                     = optional(string)<br/>    storage_mb                   = optional(number)<br/>    ha_enabled                   = optional(bool)<br/>    zone                         = optional(string)<br/>    standby_availability_zone    = optional(string)<br/>    backup_retention_days        = optional(number)<br/>    geo_redundant_backup_enabled = optional(bool)<br/>    admin_username               = optional(string)<br/>    db_name                      = optional(string)<br/>    extensions                   = optional(list(string))<br/>  }))</pre> | <pre>{<br/>  "core": {}<br/>}</pre> | no |
 | <a name="input_dns_service_ip"></a> [dns\_service\_ip](#input\_dns\_service\_ip) | Cluster DNS service IP. Must fall inside service\_cidr. | `string` | `"10.1.0.10"` | no |
@@ -885,7 +999,9 @@ No modules.
 | <a name="input_environment"></a> [environment](#input\_environment) | Environment name (dev, stg, uat, prod) | `string` | n/a | yes |
 | <a name="input_existing_aks_subnet_id"></a> [existing\_aks\_subnet\_id](#input\_existing\_aks\_subnet\_id) | Full ARM resource ID of a pre-created AKS subnet (/subscriptions/.../subnets/...). Only used if create\_vnet=false. The subnet must be sized for Azure CNI and the AKS cluster identity must be granted Network Contributor on it out-of-band. | `string` | `null` | no |
 | <a name="input_existing_appgw_subnet_id"></a> [existing\_appgw\_subnet\_id](#input\_existing\_appgw\_subnet\_id) | Full ARM resource ID of a pre-created Application Gateway subnet. Only used if create\_vnet=false. Must be dedicated to the App Gateway and the AGIC identity must be granted Network Contributor on it out-of-band. | `string` | `null` | no |
-| <a name="input_existing_postgresql_subnet_id"></a> [existing\_postgresql\_subnet\_id](#input\_existing\_postgresql\_subnet\_id) | Full ARM resource ID of a pre-created, delegated PostgreSQL subnet. Only used if create\_vnet=false and postgresql\_enabled=true. Must be delegated to Microsoft.DBforPostgreSQL/flexibleServers and dedicated. | `string` | `null` | no |
+| <a name="input_existing_postgresql_subnet_id"></a> [existing\_postgresql\_subnet\_id](#input\_existing\_postgresql\_subnet\_id) | Full ARM resource ID of a pre-created, delegated PostgreSQL subnet. Only used if create\_vnet=false, postgresql\_enabled=true and postgresql\_network\_mode=vnet\_integration. Must be delegated to Microsoft.DBforPostgreSQL/flexibleServers and dedicated. | `string` | `null` | no |
+| <a name="input_existing_private_dns_zone_ids"></a> [existing\_private\_dns\_zone\_ids](#input\_existing\_private\_dns\_zone\_ids) | ARM resource IDs of centrally managed private DNS zones, used when private\_dns\_zones\_managed\_externally = true. blob = privatelink.blob.core.windows.net, key\_vault = privatelink.vaultcore.azure.net, acr = privatelink.azurecr.io, foundry = privatelink.services.ai.azure.com, postgresql = privatelink.postgres.database.azure.com (private\_endpoint mode) or a *.postgres.database.azure.com zone (vnet\_integration mode, required there). The Terraform identity needs Private DNS Zone Contributor on each zone it registers into. | <pre>object({<br/>    blob       = optional(string)<br/>    key_vault  = optional(string)<br/>    acr        = optional(string)<br/>    foundry    = optional(string)<br/>    postgresql = optional(string)<br/>  })</pre> | `{}` | no |
+| <a name="input_existing_private_endpoint_subnet_id"></a> [existing\_private\_endpoint\_subnet\_id](#input\_existing\_private\_endpoint\_subnet\_id) | Full ARM resource ID of a dedicated subnet for the module's private endpoints (ACR, Foundry, Key Vault, storage, and PostgreSQL in private\_endpoint mode, one per server). Default null: they use the AKS subnet. Changing it on an existing deployment recreates the endpoints, which changes their IPs. | `string` | `null` | no |
 | <a name="input_existing_vnet_name"></a> [existing\_vnet\_name](#input\_existing\_vnet\_name) | Name of existing VNet (only used if create\_vnet=false) | `string` | `null` | no |
 | <a name="input_existing_vnet_rg"></a> [existing\_vnet\_rg](#input\_existing\_vnet\_rg) | Resource group of existing VNet (only used if create\_vnet=false) | `string` | `null` | no |
 | <a name="input_foundry_enabled"></a> [foundry\_enabled](#input\_foundry\_enabled) | Provision the Azure AI Foundry module (account, private endpoint, and intent workload identity) | `bool` | `false` | no |
@@ -897,7 +1013,10 @@ No modules.
 | <a name="input_foundry_sku_name"></a> [foundry\_sku\_name](#input\_foundry\_sku\_name) | SKU for the Azure AI Foundry (AI Services) account | `string` | `"S0"` | no |
 | <a name="input_key_vault_allowed_ip_ranges"></a> [key\_vault\_allowed\_ip\_ranges](#input\_key\_vault\_allowed\_ip\_ranges) | Public IPs/CIDRs allowed through the CMK Key Vault firewall (e.g. a Terraform runner outside the VNet). Give a single IP as a bare address (1.2.3.4): Key Vault rejects /31 and /32. Default empty: public traffic is denied except Azure trusted services. | `list(string)` | `[]` | no |
 | <a name="input_key_vault_private_endpoint_enabled"></a> [key\_vault\_private\_endpoint\_enabled](#input\_key\_vault\_private\_endpoint\_enabled) | Create a private endpoint + privatelink.vaultcore.azure.net DNS zone for the CMK Key Vault (enable\_cmk = true), linked to the VNet. Default true. The vault firewall always denies public traffic except Azure trusted services and key\_vault\_allowed\_ip\_ranges, so Terraform must reach the vault through this endpoint or an allowed range. Set false when privatelink.vaultcore.azure.net is managed centrally. | `bool` | `true` | no |
-| <a name="input_kubernetes_version"></a> [kubernetes\_version](#input\_kubernetes\_version) | Kubernetes version | `string` | `"1.35"` | no |
+| <a name="input_key_vault_soft_delete_retention_days"></a> [key\_vault\_soft\_delete\_retention\_days](#input\_key\_vault\_soft\_delete\_retention\_days) | Soft-delete retention in days for the CMK Key Vault (enable\_cmk = true). Default 7. Azure sets it only when the vault is created; changing it later fails, so set the final value before the first apply. | `number` | `7` | no |
+| <a name="input_kubernetes_version"></a> [kubernetes\_version](#input\_kubernetes\_version) | Kubernetes version. Give a minor version (for example 1.35) while aks\_automatic\_upgrade\_channel is set; a full patch version is allowed only when it is null. | `string` | `"1.35"` | no |
+| <a name="input_log_analytics_workspace_id"></a> [log\_analytics\_workspace\_id](#input\_log\_analytics\_workspace\_id) | Full ARM resource ID of a Log Analytics workspace. When set, AKS sends Container Insights data to it (managed identity auth). Default null: off. Diagnostic settings are left to the caller; see the resource ID outputs. | `string` | `null` | no |
+| <a name="input_log_analytics_workspace_location"></a> [log\_analytics\_workspace\_location](#input\_log\_analytics\_workspace\_location) | Region of the log\_analytics\_workspace\_id workspace. The Container Insights data collection rule must be in the workspace's region. Defaults to the resource group location. Set it when the workspace is in another region (e.g. a central hub workspace). | `string` | `null` | no |
 | <a name="input_network_data_plane"></a> [network\_data\_plane](#input\_network\_data\_plane) | AKS network dataplane. null (default): "cilium" with overlay (pod\_cidr set), "azure" without. "cilium": Azure CNI Powered by Cilium, eBPF dataplane without kube-proxy, Cilium network policy; requires overlay. "azure": legacy dataplane with Azure network policy; use it to keep overlay without Cilium. Switching azure -> cilium upgrades in place (reimages every node); cilium -> azure forces a new cluster. | `string` | `null` | no |
 | <a name="input_node_groups"></a> [node\_groups](#input\_node\_groups) | AKS node pools keyed by name. "system" is the cluster's system pool; every other key is a user pool. A pool autoscales between min\_size and max\_size, or is fixed at that size when they are equal. | <pre>map(object({<br/>    vm_size                     = string<br/>    min_size                    = number<br/>    max_size                    = number<br/>    disk_size                   = optional(number, 128)<br/>    temporary_name_for_rotation = optional(string)<br/>    labels                      = map(string)<br/>    taints = optional(list(object({<br/>      key    = string<br/>      value  = string<br/>      effect = string # Azure expects PascalCase: NoSchedule | PreferNoSchedule | NoExecute<br/>    })), [])<br/>  }))</pre> | <pre>{<br/>  "application": {<br/>    "disk_size": 256,<br/>    "labels": {<br/>      "workload-type": "application"<br/>    },<br/>    "max_size": 3,<br/>    "min_size": 1,<br/>    "temporary_name_for_rotation": "apptmp",<br/>    "vm_size": "Standard_D4as_v7"<br/>  },<br/>  "support": {<br/>    "disk_size": 128,<br/>    "labels": {<br/>      "workload-type": "support"<br/>    },<br/>    "max_size": 3,<br/>    "min_size": 1,<br/>    "temporary_name_for_rotation": "supprttmp",<br/>    "vm_size": "Standard_E2as_v7"<br/>  },<br/>  "system": {<br/>    "disk_size": 128,<br/>    "labels": {<br/>      "workload-type": "system"<br/>    },<br/>    "max_size": 3,<br/>    "min_size": 3,<br/>    "vm_size": "Standard_D2s_v6"<br/>  }<br/>}</pre> | no |
 | <a name="input_pod_cidr"></a> [pod\_cidr](#input\_pod\_cidr) | Pod IP range for Azure CNI Overlay (the default). Pods take IPs from this<br/>range instead of the AKS subnet, the range is never routed (pod egress is<br/>SNAT'd to the node IP), and the AKS subnet only needs to hold nodes and<br/>private endpoints. Each node takes a /24 from the range, so the default<br/>/16 fits 256 nodes. Must not overlap service\_cidr, the VNet, or any<br/>peered / on-premises network. Set null for Azure CNI without overlay<br/>(pods take VNet IPs; size the AKS subnet for it).<br/><br/>Set it before the first apply: changing it forces a new cluster. With<br/>overlay, the App Gateway subnet must be /24 or smaller and delegated to<br/>Microsoft.Network/applicationGateways (the module adds the delegation<br/>when create\_vnet = true; do it yourself on a BYO subnet). | `string` | `"100.64.0.0/16"` | no |
@@ -906,15 +1025,18 @@ No modules.
 | <a name="input_postgresql_enabled"></a> [postgresql\_enabled](#input\_postgresql\_enabled) | Deploy PostgreSQL Flexible Server | `bool` | `true` | no |
 | <a name="input_postgresql_extensions"></a> [postgresql\_extensions](#input\_postgresql\_extensions) | PostgreSQL extensions to allow-list on Azure Flexible Server | `list(string)` | <pre>[<br/>  "VECTOR",<br/>  "PG_TRGM",<br/>  "UUID-OSSP",<br/>  "PGCRYPTO"<br/>]</pre> | no |
 | <a name="input_postgresql_ha_enabled"></a> [postgresql\_ha\_enabled](#input\_postgresql\_ha\_enabled) | Enable zone-redundant high availability for PostgreSQL | `bool` | `false` | no |
+| <a name="input_postgresql_network_mode"></a> [postgresql\_network\_mode](#input\_postgresql\_network\_mode) | How PostgreSQL is reached privately. "vnet\_integration" (default): servers sit in a delegated subnet. "private\_endpoint": no delegated subnet; each server gets a private endpoint in the private endpoint subnet and uses privatelink.postgres.database.azure.com. Fixed at creation: changing it recreates every server and loses its data. | `string` | `"vnet_integration"` | no |
 | <a name="input_postgresql_sku_name"></a> [postgresql\_sku\_name](#input\_postgresql\_sku\_name) | PostgreSQL SKU (e.g., GP\_Standard\_D2s\_v3, MO\_Standard\_E4s\_v3) | `string` | `"GP_Standard_D2s_v3"` | no |
 | <a name="input_postgresql_storage_mb"></a> [postgresql\_storage\_mb](#input\_postgresql\_storage\_mb) | PostgreSQL storage size in MB | `number` | `131072` | no |
 | <a name="input_postgresql_subnet_address_prefix"></a> [postgresql\_subnet\_address\_prefix](#input\_postgresql\_subnet\_address\_prefix) | Address prefix for PostgreSQL subnet | `string` | `"10.0.17.0/24"` | no |
 | <a name="input_postgresql_version"></a> [postgresql\_version](#input\_postgresql\_version) | PostgreSQL version | `string` | `"17"` | no |
 | <a name="input_private_cluster_enabled"></a> [private\_cluster\_enabled](#input\_private\_cluster\_enabled) | Private cluster API (no public endpoint). Default true. Terraform must run from a host that can reach and resolve the private API: a runner inside the VNet or a peered network (e.g. an HCP Terraform agent on a VM). The in-cluster TFC agent cannot bootstrap a private cluster. Set false (with api\_server\_authorized\_cidrs) to opt into a public API. Changing this forces a new cluster. | `bool` | `true` | no |
+| <a name="input_private_dns_zones_managed_externally"></a> [private\_dns\_zones\_managed\_externally](#input\_private\_dns\_zones\_managed\_externally) | When true, the module creates no private DNS zones or VNet links (blob, Key Vault, ACR, PostgreSQL, Foundry): they live centrally, e.g. in a hub subscription. Each private endpoint registers into the matching existing\_private\_dns\_zone\_ids entry, or gets no DNS zone group when that entry is null (central policy registers the record). Default false. Set it before the first apply: turning it on in an existing deployment destroys the module's zones, VNet links and A records (link the hub zones to the VNet first), and with postgresql\_network\_mode = "vnet\_integration" the changed private\_dns\_zone\_id can replace every PostgreSQL server. Run a plan first. | `bool` | `false` | no |
 | <a name="input_project_name"></a> [project\_name](#input\_project\_name) | Project name used in resource naming | `string` | `"optura"` | no |
 | <a name="input_region"></a> [region](#input\_region) | Azure region for all resources | `string` | `"eastus2"` | no |
 | <a name="input_registry_enabled"></a> [registry\_enabled](#input\_registry\_enabled) | Deploy Azure Container Registry | `bool` | `false` | no |
 | <a name="input_service_cidr"></a> [service\_cidr](#input\_service\_cidr) | In-cluster ClusterIP service range for AKS (Azure CNI). Must NOT overlap the VNet address space or any subnet — critical when create\_vnet=false and the VNet is centrally managed. | `string` | `"10.1.0.0/16"` | no |
+| <a name="input_storage_delete_retention_days"></a> [storage\_delete\_retention\_days](#input\_storage\_delete\_retention\_days) | Soft-delete retention in days for blobs and containers in the logging and general storage accounts. Default 7. | `number` | `7` | no |
 | <a name="input_storage_general_account_name"></a> [storage\_general\_account\_name](#input\_storage\_general\_account\_name) | Override storage account name for general storage (default: {project}{environment}storage). Used to dodge Azure's ~14-day global name reservation when redeploying. Must be 3-24 lowercase alphanumeric chars. | `string` | `null` | no |
 | <a name="input_storage_general_cors_origins"></a> [storage\_general\_cors\_origins](#input\_storage\_general\_cors\_origins) | Browser origins allowed to call the general storage account directly (presigned uploads). Empty disables CORS, which blocks every browser upload. | `list(string)` | `[]` | no |
 | <a name="input_storage_general_enabled"></a> [storage\_general\_enabled](#input\_storage\_general\_enabled) | Deploy general storage account | `bool` | `true` | no |
@@ -926,6 +1048,7 @@ No modules.
 | <a name="input_storage_logging_lifecycle"></a> [storage\_logging\_lifecycle](#input\_storage\_logging\_lifecycle) | Lifecycle policy for logging storage | <pre>object({<br/>    transition_to_cool_days    = number<br/>    transition_to_archive_days = number<br/>    expiration_days            = number<br/>  })</pre> | <pre>{<br/>  "expiration_days": 365,<br/>  "transition_to_archive_days": 90,<br/>  "transition_to_cool_days": 30<br/>}</pre> | no |
 | <a name="input_storage_logging_private_endpoint_enabled"></a> [storage\_logging\_private\_endpoint\_enabled](#input\_storage\_logging\_private\_endpoint\_enabled) | Provision a private endpoint for the logging storage blob endpoint, registered in the same privatelink.blob.core.windows.net zone as the general storage endpoint. Default true. Same central-DNS caveat as storage\_general\_private\_endpoint\_enabled. | `bool` | `true` | no |
 | <a name="input_storage_public_network_access_enabled"></a> [storage\_public\_network\_access\_enabled](#input\_storage\_public\_network\_access\_enabled) | Allow public network access to the logging and general storage accounts. Default false: they are reachable only through their private endpoints, so every enabled account needs its private endpoint, and browser uploads via presigned URLs need a private network path (and privatelink DNS) to the endpoint. Set true for a public App Gateway frontend. | `bool` | `false` | no |
+| <a name="input_storage_replication_type"></a> [storage\_replication\_type](#input\_storage\_replication\_type) | Replication for the logging and general storage accounts: LRS, ZRS, GRS, RAGRS, GZRS or RAGZRS. Default LRS. Moving to or from a zone-redundant type (ZRS, GZRS, RAGZRS) recreates the account, so choose it before the first apply. Azure has no archive tier for zone-redundant types, so with ZRS, GZRS or RAGZRS the logging lifecycle skips transition\_to\_archive\_days. | `string` | `"LRS"` | no |
 | <a name="input_subscription_id"></a> [subscription\_id](#input\_subscription\_id) | Azure subscription ID | `string` | n/a | yes |
 | <a name="input_tags"></a> [tags](#input\_tags) | Common tags applied to all resources | `map(string)` | `{}` | no |
 | <a name="input_teleport_agent_chart_repository"></a> [teleport\_agent\_chart\_repository](#input\_teleport\_agent\_chart\_repository) | Helm repository for the teleport-kube-agent chart (e.g. https://charts.releases.teleport.dev or oci://your-registry/charts). Required when access\_mode = teleport — supply your own. | `string` | `""` | no |
@@ -974,7 +1097,9 @@ No modules.
 | <a name="output_database_name"></a> [database\_name](#output\_database\_name) | Name of the primary (core) database |
 | <a name="output_database_names"></a> [database\_names](#output\_database\_names) | Initial database name for each named PostgreSQL server |
 | <a name="output_database_port"></a> [database\_port](#output\_database\_port) | Port of the database server |
+| <a name="output_database_server_ids"></a> [database\_server\_ids](#output\_database\_server\_ids) | Resource ID of each named PostgreSQL Flexible Server, keyed by database name (for diagnostic settings) |
 | <a name="output_database_server_name"></a> [database\_server\_name](#output\_database\_server\_name) | Name of the primary (core) database server |
+| <a name="output_foundry_account_id"></a> [foundry\_account\_id](#output\_foundry\_account\_id) | Resource ID of the Azure AI Foundry account (null when foundry\_enabled = false) |
 | <a name="output_general_storage_id"></a> [general\_storage\_id](#output\_general\_storage\_id) | ID of the general storage |
 | <a name="output_general_storage_name"></a> [general\_storage\_name](#output\_general\_storage\_name) | Name of the general storage |
 | <a name="output_general_storage_region"></a> [general\_storage\_region](#output\_general\_storage\_region) | Region of the general storage |
