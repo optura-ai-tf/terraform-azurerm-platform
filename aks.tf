@@ -62,6 +62,7 @@ resource "azurerm_kubernetes_cluster" "main" {
     os_disk_type                 = "Managed"
     os_disk_size_gb              = local.system_pool.disk_size
     only_critical_addons_enabled = true
+    max_pods                     = var.max_pods_per_node
 
     # VNet integration
     vnet_subnet_id = local.aks_subnet_id

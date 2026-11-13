@@ -619,7 +619,7 @@ Default: **`teleport`** — the module deploys a Teleport agent. (`vpn` assumes 
 |---|---|---|
 | `teleport_proxy_address` | yes | The Teleport proxy to connect to (e.g. `teleport.example.com:443`) |
 | `teleport_agent_chart_repository` | yes | Helm repo for the teleport-kube-agent chart (e.g. `https://charts.releases.teleport.dev`, or an OCI mirror) |
-| `teleport_agent_image` | no | Agent image; empty uses the chart's default |
+| `teleport_agent_image` | no | Enterprise agent image (`teleport-ent-distroless`); empty uses the chart's default |
 | `teleport_join_token` | yes | Set via `export TF_VAR_teleport_join_token="..."` |
 | `teleport_ca_pin` | recommended (prod) | CA pin for secure agent joining |
 | `teleport_db_enabled` | `true` | Also enable Teleport database access. Requires `postgresql_enabled = true`. |
@@ -818,7 +818,7 @@ The tables below are generated from the module source by `terraform-docs`. Do no
 ## Requirements
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.9.0 |
 | <a name="requirement_azuread"></a> [azuread](#requirement\_azuread) | >= 3.6 |
 | <a name="requirement_azurerm"></a> [azurerm](#requirement\_azurerm) | >= 4.65, < 5.0 |
@@ -831,7 +831,7 @@ The tables below are generated from the module source by `terraform-docs`. Do no
 ## Providers
 
 | Name | Version |
-|------|---------|
+| ---- | ------- |
 | <a name="provider_azuread"></a> [azuread](#provider\_azuread) | >= 3.6 |
 | <a name="provider_azurerm"></a> [azurerm](#provider\_azurerm) | >= 4.65, < 5.0 |
 | <a name="provider_helm"></a> [helm](#provider\_helm) | >= 3.1 |
@@ -848,7 +848,7 @@ No modules.
 ## Resources
 
 | Name | Type |
-|------|------|
+| ---- | ---- |
 | [azurerm_application_gateway.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/application_gateway) | resource |
 | [azurerm_cognitive_account.foundry](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/cognitive_account) | resource |
 | [azurerm_container_registry.main](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs/resources/container_registry) | resource |
@@ -962,7 +962,7 @@ No modules.
 ## Inputs
 
 | Name | Description | Type | Default | Required |
-|------|-------------|------|---------|:--------:|
+| ---- | ----------- | ---- | ------- | :------: |
 | <a name="input_access_mode"></a> [access\_mode](#input\_access\_mode) | K8s API access mode (teleport or vpn) | `string` | `"teleport"` | no |
 | <a name="input_acr_allowed_ip_ranges"></a> [acr\_allowed\_ip\_ranges](#input\_acr\_allowed\_ip\_ranges) | CIDRs allowed through the ACR firewall on the public endpoint (e.g. a vendor CI that pushes images). When non-empty, the public endpoint is enabled with default\_action = Deny and only these ranges allowed. Premium SKU only. | `list(string)` | `[]` | no |
 | <a name="input_acr_private_endpoint_enabled"></a> [acr\_private\_endpoint\_enabled](#input\_acr\_private\_endpoint\_enabled) | Create a private endpoint + privatelink.azurecr.io DNS zone for ACR, linked to the VNet. Premium SKU only. Set false when privatelink.azurecr.io is managed centrally and register the endpoint out-of-band. | `bool` | `true` | no |
@@ -1017,6 +1017,7 @@ No modules.
 | <a name="input_kubernetes_version"></a> [kubernetes\_version](#input\_kubernetes\_version) | Kubernetes version. Give a minor version (for example 1.35) while aks\_automatic\_upgrade\_channel is set; a full patch version is allowed only when it is null. | `string` | `"1.35"` | no |
 | <a name="input_log_analytics_workspace_id"></a> [log\_analytics\_workspace\_id](#input\_log\_analytics\_workspace\_id) | Full ARM resource ID of a Log Analytics workspace. When set, AKS sends Container Insights data to it (managed identity auth). Default null: off. Diagnostic settings are left to the caller; see the resource ID outputs. | `string` | `null` | no |
 | <a name="input_log_analytics_workspace_location"></a> [log\_analytics\_workspace\_location](#input\_log\_analytics\_workspace\_location) | Region of the log\_analytics\_workspace\_id workspace. The Container Insights data collection rule must be in the workspace's region. Defaults to the resource group location. Set it when the workspace is in another region (e.g. a central hub workspace). | `string` | `null` | no |
+| <a name="input_max_pods_per_node"></a> [max\_pods\_per\_node](#input\_max\_pods\_per\_node) | Maximum pods per node for every node pool. null (default) keeps the AKS default: 250 with overlay (pod\_cidr set), 30 without. At least 30, the AKS floor for system pools. Without overlay each node reserves this many AKS subnet IPs, so size the subnet for it. Changing it rotates every node pool through its temporary\_name\_for\_rotation. | `number` | `null` | no |
 | <a name="input_network_data_plane"></a> [network\_data\_plane](#input\_network\_data\_plane) | AKS network dataplane. null (default): "cilium" with overlay (pod\_cidr set), "azure" without. "cilium": Azure CNI Powered by Cilium, eBPF dataplane without kube-proxy, Cilium network policy; requires overlay. "azure": legacy dataplane with Azure network policy; use it to keep overlay without Cilium. Switching azure -> cilium upgrades in place (reimages every node); cilium -> azure forces a new cluster. | `string` | `null` | no |
 | <a name="input_node_groups"></a> [node\_groups](#input\_node\_groups) | AKS node pools keyed by name. "system" is the cluster's system pool; every other key is a user pool. A pool autoscales between min\_size and max\_size, or is fixed at that size when they are equal. | <pre>map(object({<br/>    vm_size                     = string<br/>    min_size                    = number<br/>    max_size                    = number<br/>    disk_size                   = optional(number, 128)<br/>    temporary_name_for_rotation = optional(string)<br/>    labels                      = map(string)<br/>    taints = optional(list(object({<br/>      key    = string<br/>      value  = string<br/>      effect = string # Azure expects PascalCase: NoSchedule | PreferNoSchedule | NoExecute<br/>    })), [])<br/>  }))</pre> | <pre>{<br/>  "application": {<br/>    "disk_size": 256,<br/>    "labels": {<br/>      "workload-type": "application"<br/>    },<br/>    "max_size": 3,<br/>    "min_size": 1,<br/>    "temporary_name_for_rotation": "apptmp",<br/>    "vm_size": "Standard_D4as_v7"<br/>  },<br/>  "support": {<br/>    "disk_size": 128,<br/>    "labels": {<br/>      "workload-type": "support"<br/>    },<br/>    "max_size": 3,<br/>    "min_size": 1,<br/>    "temporary_name_for_rotation": "supprttmp",<br/>    "vm_size": "Standard_E2as_v7"<br/>  },<br/>  "system": {<br/>    "disk_size": 128,<br/>    "labels": {<br/>      "workload-type": "system"<br/>    },<br/>    "max_size": 3,<br/>    "min_size": 3,<br/>    "vm_size": "Standard_D2s_v6"<br/>  }<br/>}</pre> | no |
 | <a name="input_pod_cidr"></a> [pod\_cidr](#input\_pod\_cidr) | Pod IP range for Azure CNI Overlay (the default). Pods take IPs from this<br/>range instead of the AKS subnet, the range is never routed (pod egress is<br/>SNAT'd to the node IP), and the AKS subnet only needs to hold nodes and<br/>private endpoints. Each node takes a /24 from the range, so the default<br/>/16 fits 256 nodes. Must not overlap service\_cidr, the VNet, or any<br/>peered / on-premises network. Set null for Azure CNI without overlay<br/>(pods take VNet IPs; size the AKS subnet for it).<br/><br/>Set it before the first apply: changing it forces a new cluster. With<br/>overlay, the App Gateway subnet must be /24 or smaller and delegated to<br/>Microsoft.Network/applicationGateways (the module adds the delegation<br/>when create\_vnet = true; do it yourself on a BYO subnet). | `string` | `"100.64.0.0/16"` | no |
@@ -1052,13 +1053,13 @@ No modules.
 | <a name="input_subscription_id"></a> [subscription\_id](#input\_subscription\_id) | Azure subscription ID | `string` | n/a | yes |
 | <a name="input_tags"></a> [tags](#input\_tags) | Common tags applied to all resources | `map(string)` | `{}` | no |
 | <a name="input_teleport_agent_chart_repository"></a> [teleport\_agent\_chart\_repository](#input\_teleport\_agent\_chart\_repository) | Helm repository for the teleport-kube-agent chart (e.g. https://charts.releases.teleport.dev or oci://your-registry/charts). Required when access\_mode = teleport — supply your own. | `string` | `""` | no |
-| <a name="input_teleport_agent_image"></a> [teleport\_agent\_image](#input\_teleport\_agent\_image) | Container image reference for the Teleport agent (e.g. your-registry/teleport-distroless). Leave empty to use the chart's default image; set to pull from your own registry (required for egress-restricted clusters). | `string` | `""` | no |
+| <a name="input_teleport_agent_image"></a> [teleport\_agent\_image](#input\_teleport\_agent\_image) | Container image reference for the Teleport agent (e.g. your-registry/teleport-ent-distroless, the Enterprise image). Leave empty to use the chart's default image; set to pull from your own registry (required for egress-restricted clusters). | `string` | `""` | no |
 | <a name="input_teleport_ca_pin"></a> [teleport\_ca\_pin](#input\_teleport\_ca\_pin) | Teleport CA pin (optional, recommended for prod) | `string` | `null` | no |
 | <a name="input_teleport_db_enabled"></a> [teleport\_db\_enabled](#input\_teleport\_db\_enabled) | Enable Teleport database service for PostgreSQL | `bool` | `true` | no |
 | <a name="input_teleport_gateway_ip"></a> [teleport\_gateway\_ip](#input\_teleport\_gateway\_ip) | Static IP of the egress gateway proxy. When set, hostAliases route the Teleport proxy hostname through this IP so all agent traffic exits via a single static IP. Defaults to null (disabled) — supply your deployment's egress IP. | `string` | `null` | no |
 | <a name="input_teleport_join_token"></a> [teleport\_join\_token](#input\_teleport\_join\_token) | Teleport agent join token (used for all services: kube, app, db, discovery) | `string` | `null` | no |
 | <a name="input_teleport_proxy_address"></a> [teleport\_proxy\_address](#input\_teleport\_proxy\_address) | Teleport proxy address as host:port (required when access\_mode = teleport). Defaults to empty — supply your own Teleport proxy. | `string` | `""` | no |
-| <a name="input_teleport_version"></a> [teleport\_version](#input\_teleport\_version) | Teleport version | `string` | `"18.5.1"` | no |
+| <a name="input_teleport_version"></a> [teleport\_version](#input\_teleport\_version) | teleport-kube-agent chart version. Must not be newer than the Teleport Cloud control plane. | `string` | `"18.11.7"` | no |
 | <a name="input_tfc_agent_enabled"></a> [tfc\_agent\_enabled](#input\_tfc\_agent\_enabled) | Deploy Terraform Cloud Agent for private cluster access | `bool` | `false` | no |
 | <a name="input_tfc_agent_token"></a> [tfc\_agent\_token](#input\_tfc\_agent\_token) | Terraform Cloud Agent token (sensitive, set via TF\_VAR\_tfc\_agent\_token) | `string` | `null` | no |
 | <a name="input_tfc_agent_version"></a> [tfc\_agent\_version](#input\_tfc\_agent\_version) | TFC Agent container image tag | `string` | `"1.28.5"` | no |
@@ -1072,7 +1073,7 @@ No modules.
 ## Outputs
 
 | Name | Description |
-|------|-------------|
+| ---- | ----------- |
 | <a name="output_access_mode"></a> [access\_mode](#output\_access\_mode) | Current K8s API access mode |
 | <a name="output_api_endpoint_access_type"></a> [api\_endpoint\_access\_type](#output\_api\_endpoint\_access\_type) | Type of access to the K8s API endpoint |
 | <a name="output_application_gateway_fqdn"></a> [application\_gateway\_fqdn](#output\_application\_gateway\_fqdn) | FQDN of the Application Gateway public IP (null when appgw\_frontend\_type = "private") |

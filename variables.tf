@@ -400,6 +400,17 @@ variable "node_groups" {
   }
 }
 
+variable "max_pods_per_node" {
+  description = "Maximum pods per node for every node pool. null (default) keeps the AKS default: 250 with overlay (pod_cidr set), 30 without. At least 30, the AKS floor for system pools. Without overlay each node reserves this many AKS subnet IPs, so size the subnet for it. Changing it rotates every node pool through its temporary_name_for_rotation."
+  type        = number
+  default     = null
+
+  validation {
+    condition     = var.max_pods_per_node == null || (var.max_pods_per_node >= 30 && var.max_pods_per_node <= 250)
+    error_message = "max_pods_per_node must be null or between 30 and 250 (30 is the AKS system pool floor)."
+  }
+}
+
 variable "availability_zones" {
   description = "Availability zones for AKS nodes and the App Gateway. Azure can restrict a VM size in a zone per subscription (common on new subscriptions); check with az vm list-skus. Set before the first apply: changing it later replaces the App Gateway (only its public IP ignores zone changes)."
   type        = list(string)
@@ -1108,9 +1119,9 @@ variable "teleport_ca_pin" {
 }
 
 variable "teleport_version" {
-  description = "Teleport version"
+  description = "teleport-kube-agent chart version. Must not be newer than the Teleport Cloud control plane."
   type        = string
-  default     = "18.5.1"
+  default     = "18.11.7"
 }
 
 variable "teleport_agent_chart_repository" {
@@ -1120,7 +1131,7 @@ variable "teleport_agent_chart_repository" {
 }
 
 variable "teleport_agent_image" {
-  description = "Container image reference for the Teleport agent (e.g. your-registry/teleport-distroless). Leave empty to use the chart's default image; set to pull from your own registry (required for egress-restricted clusters)."
+  description = "Container image reference for the Teleport agent (e.g. your-registry/teleport-ent-distroless, the Enterprise image). Leave empty to use the chart's default image; set to pull from your own registry (required for egress-restricted clusters)."
   type        = string
   default     = ""
 }

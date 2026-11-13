@@ -168,10 +168,18 @@ resource "helm_release" "teleport_kube_agent" {
 
   # Core configuration
   set = concat(
-    # Custom agent image (e.g. a private-registry mirror) — omit to use the chart's default image
+    # Teleport Cloud is Enterprise: run the Enterprise agent image. With
+    # `enterprise`, the chart reads `enterpriseImage` and ignores `image`.
+    [
+      {
+        name  = "enterprise"
+        value = "true"
+      }
+    ],
+    # Custom agent image (e.g. a private-registry mirror of teleport-ent-distroless) — omit to use the chart's default
     var.teleport_agent_image != null && var.teleport_agent_image != "" ? [
       {
-        name  = "image"
+        name  = "enterpriseImage"
         value = var.teleport_agent_image
       }
     ] : [],

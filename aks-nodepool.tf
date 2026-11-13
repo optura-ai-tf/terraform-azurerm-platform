@@ -20,6 +20,7 @@ resource "azurerm_kubernetes_cluster_node_pool" "user" {
   os_type         = "Linux"
   os_disk_type    = "Managed"
   os_disk_size_gb = each.value.disk_size
+  max_pods        = var.max_pods_per_node
 
   # VNet integration
   vnet_subnet_id = local.aks_subnet_id

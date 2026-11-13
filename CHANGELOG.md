@@ -6,6 +6,27 @@ form `azure/platform/vX.Y.Z`.
 
 ## Unreleased
 
+## 1.1.1 — 2026-11-13
+
+### Added
+
+- **`max_pods_per_node`** sets the maximum pods per node on the system pool
+  and every user pool. Defaults to `null`, which keeps the AKS default (250
+  with overlay, 30 without), so existing pools plan no change. Changing it
+  rotates every pool through its `temporary_name_for_rotation`.
+
+### Changed
+
+- **The Teleport agent runs the Enterprise image** (`teleport-ent-distroless`),
+  since Optura's Teleport Cloud cluster is Enterprise. The chart's `enterprise`
+  flag is set, and `teleport_agent_image` now sets the chart's `enterpriseImage`.
+  If you mirror the agent image, mirror `teleport-ent-distroless` and point
+  `teleport_agent_image` at it.
+- **`teleport_version` defaults to `18.11.7`** (was `18.5.1`), matching the
+  Teleport Cloud control plane. Agents must never be newer than it. Picks up
+  the Kubernetes Access RBAC bypass fix from 18.10.7. The agent pod restarts
+  on apply, so Teleport access to the cluster drops for about a minute.
+
 ## 1.1.0 — 2026-11-04
 
 Release as **1.1.0** (Version Bump workflow, `minor`). Every new input is
